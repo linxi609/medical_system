@@ -147,6 +147,38 @@ int medical_record_add(DB_HANDLE* db, MedicalRecord* r) {
  * 返回：0 成功；-1 未连接；-2 SQL 失败；-4 病历不存在；
  *       -6 不是本人书写的；-7 已超过 24 小时锁定
  * ========================================================================== */
+/* --------------------------------------------------------------------------
+ * 检查一条病历当前能不能被 doctor_id 修改
+ * 返回：0 可以修改；-4 病历不存在；-6 不是本人书写的；-7 已超过 24 小时被锁定
+ * -------------------------------------------------------------------------- */
+static int mr_check_editable(DB_HANDLE* db, int record_id, const char* doctor_id) {
+    char   buf[256];
+    DB_RES* res;
+    DB_ROW* row;
+    int    ret;
+
+    snprintf(buf, sizeof(buf),
+             "SELECT doctor_id, (TIMESTAMPDIFF(MINUTE, update_time, NOW()) >= %d) "
+             "FROM t_medical_record WHERE record_id = %d",
+             MR_LOCK_MINUTES, record_id);
+
+    res = db_query(db, buf);
+    if (!res) return -2;
+
+    row = db_fetch_row(res);
+    if (!row) {                                                /* 病历不存在 */
+        db_res_free(res);
+        return -4;
+    }
+    if (strcmp(col_str(res, row, 0), doctor_id) != 0) {        /* 列 0 = doctor_id */
+        db_res_free(res);
+        return -6;                                             /* 不是本人书写的 */
+    }
+    ret = col_int(res, row, 1) ? -7 : 0;                       /* 列 1 = 是否超 24 小时 */
+    db_res_free(res);
+    return ret;
+}
+
 int medical_record_update(DB_HANDLE* db, const MedicalRecord* r) {
     char   buf[MR_SQL_BUF];
     char   esc_allergy[MR_ESC_BUF];
@@ -157,9 +189,7 @@ int medical_record_update(DB_HANDLE* db, const MedicalRecord* r) {
     char*  lit_past;
     char*  lit_family;
     char*  lit_did;
-    DB_RES* res;
-    DB_ROW* row;
-    int    locked;
+    int    ret;
     int    affected;
 
     /* ---------- 入参校验 ---------- */
@@ -169,27 +199,8 @@ int medical_record_update(DB_HANDLE* db, const MedicalRecord* r) {
     if (r->doctor_id[0] == '\0') return -6;
 
     /* ---------- 先查这条病历：在不在、谁写的、有没有超 24 小时 ---------- */
-    snprintf(buf, sizeof(buf),
-             "SELECT doctor_id, (TIMESTAMPDIFF(MINUTE, update_time, NOW()) >= %d) "
-             "FROM t_medical_record WHERE record_id = %d",
-             MR_LOCK_MINUTES, r->record_id);
-
-    res = db_query(db, buf);
-    if (!res) return -2;
-
-    row = db_fetch_row(res);
-    if (!row) {                                                /* 病历不存在 */
-        db_res_free(res);
-        return -4;
-    }
-    if (strcmp(col_str(res, row, 0), r->doctor_id) != 0) {    /* 列 0 = doctor_id */
-        db_res_free(res);
-        return -6;                                             /* 不是本人书写的 */
-    }
-    locked = col_int(res, row, 1);                             /* 列 1 = 是否超 24 小时 */
-    db_res_free(res);
-
-    if (locked) return -7;                    /* 已锁定，让调用方提示"病历已锁定" */
+    ret = mr_check_editable(db, r->record_id, r->doctor_id);
+    if (ret != 0) return ret;
 
     /* ---------- 转义并更新 ---------- */
     lit_allergy = escape_str(db, r->allergy_history, esc_allergy, sizeof(esc_allergy));
@@ -211,7 +222,13 @@ int medical_record_update(DB_HANDLE* db, const MedicalRecord* r) {
 
     affected = db_execute(db, buf);
     if (affected < 0) return -2;
-    if (affected == 0) return -7;    /* 没改到行：这期间已被改成超时或换了医生 */
+
+    /* 影响 0 行有两种可能，必须分清：
+     *   (1) 三个字段和新值完全一样、update_time 也在同一秒内，MySQL 认为
+     *       "没有改动"——这其实是修改成功了，不能报 -7；
+     *   (2) 查完到改之间被人抢先改了医生或超了 24 小时，被 UPDATE 的 WHERE 过滤掉。
+     * 再查一次当前状态就能区分 */
+    if (affected == 0) return mr_check_editable(db, r->record_id, r->doctor_id);
 
     return 0;
 }

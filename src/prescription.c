@@ -13,8 +13,9 @@
  *      整张处方都不生效，统一 ROLLBACK。
  *   2) unit_price 取开方当刻 t_medicine.price 的快照，之后药品调价不影响
  *      已有处方；subtotal = quantity × unit_price 由本函数算好入库。
- *   3) 同一张处方里若重复出现同一个药品编号，会叠加校验已占用的数量，
- *      避免"每行单独看都够、合起来超库存"。
+ *   3) 库存校验按"逐行比较当前库存"做：本事务前面几行已经扣过库存，
+ *      每一行读到的都是扣完之后的值，所以直接比本行数量即可，
+ *      同一药品分多行录入也自然叠加，不会误报。
  *   4) prescription_void 只把 status 置 0，不回滚库存——药已经发给患者了。
  * ========================================================================== */
 
@@ -27,7 +28,7 @@
 #define PRESC_SQL_BUF 4096
 /* 诊断结果在结构体里 200 字节，转义后最多 400，取 512 足够 */
 #define PRESC_ESC_BUF 512
-/* 一次处方最多允许的明细条数（受下面栈上 used[] 的容量限制） */
+/* 一次处方最多允许的明细条数（明细数组由调用方提供，这里限个上限） */
 #define PRESC_MAX_ITEMS 64
 
 /* --------------------------------------------------------------------------
@@ -80,7 +81,9 @@ static int begin_tx(DB_HANDLE* db) {
 /* --------------------------------------------------------------------------
  * 内部函数声明
  * -------------------------------------------------------------------------- */
-static int presc_visit_exists(DB_HANDLE* db, int visit_id);
+static int presc_fetch_visit(DB_HANDLE* db, int visit_id,
+                             char* out_patient, size_t patient_size,
+                             char* out_doctor, size_t doctor_size);
 static int presc_fetch_medicine(DB_HANDLE* db, const char* med_id,
                                 double* out_price, int* out_stock);
 static int presc_load(DB_HANDLE* db, const char* where,
@@ -89,7 +92,7 @@ static int presc_load(DB_HANDLE* db, const char* where,
 /* ==========================================================================
  * 开处方
  * 返回：0 成功；-1 未连接；-2 SQL 失败（已回滚）；-4 就诊记录不存在；
- *       -5 库存不足（已回滚）
+ *       -5 库存不足（已回滚）；-6 该就诊不是本人接诊的
  * ========================================================================== */
 int prescription_add(DB_HANDLE* db, Prescription* p,
                      PrescDetail* items, int item_count) {
@@ -104,12 +107,11 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
     char*  lit_did;
     char*  lit_med;
     char*  lit_dos;
-    int    used[PRESC_MAX_ITEMS];   /* 第 i 条明细累计占用的数量（含前面重复的药品） */
+    char   visit_patient[20];       /* 就诊记录里的患者编号（以此为准） */
+    char   visit_doctor[10];        /* 就诊记录里的接诊医生编号 */
     double price;
     int    stock;
-    int    already;
     int    i;
-    int    j;
     int    visit_ok;
     int    med_ok;
     int    ret = -2;                /* 默认按 SQL 失败处理，出错分支里再改具体码 */
@@ -124,11 +126,20 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
     int t = begin_tx(db);
     if (t != 0) return t;                             /* -1 未连接 / -2 BEGIN 失败 */
 
-    /* ---------- 校验就诊记录存在 ----------
-     * 处方必须挂在自己出具的就诊记录上，否则会出现"给别人的就诊开处方"。 */
-    visit_ok = presc_visit_exists(db, p->visit_id);
+    /* ---------- 校验就诊记录 ----------
+     * 1) 记录必须存在
+     * 2) 必须是本人接诊的：不查这条的话，医生输入别人的就诊ID就能开方，
+     *    处方会挂到别人经手的就诊上，属于静默的越权写库
+     * 3) 患者编号以就诊记录里的为准，调用方填什么都不作数——菜单允许手输
+     *    患者编号，填错一位就会把处方记到别的患者名下 */
+    visit_ok = presc_fetch_visit(db, p->visit_id,
+                                 visit_patient, sizeof(visit_patient),
+                                 visit_doctor,  sizeof(visit_doctor));
     if (visit_ok < 0) goto fail;                      /* SQL 失败 */
     if (visit_ok == 0) { ret = -4; goto fail; }       /* 就诊记录不存在 */
+    if (strcmp(visit_doctor, p->doctor_id) != 0) { ret = -6; goto fail; }
+
+    snprintf(p->patient_id, sizeof(p->patient_id), "%s", visit_patient);
 
     /* ---------- 写处方主表 ---------- */
     lit_diag = escape_str(db, p->diagnosis,  esc_diag, sizeof(esc_diag));
@@ -151,19 +162,14 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
     for (i = 0; i < item_count; i++) {
         if (items[i].quantity <= 0) { ret = -5; goto fail; }
 
-        /* 这一行要多少，加上前面已经开过的同一种药，不能超过库存 */
-        already = 0;
-        for (j = 0; j < i; j++) {
-            if (strcmp(items[j].med_id, items[i].med_id) == 0) already += items[j].quantity;
-        }
-        used[i] = already + items[i].quantity;
-
-        /* 查药品当前单价和库存，FOR UPDATE 锁住这一行，防止并发开方超卖 */
+        /* 查药品当前单价和库存，FOR UPDATE 锁住这一行，防止并发开方超卖。
+         * 同一药品分多行录入时不需要额外累加：本事务前面几行已经扣过库存，
+         * 这里读到的就是扣完之后的当前值，直接比本行数量即可 */
         med_ok = presc_fetch_medicine(db, items[i].med_id, &price, &stock);
         if (med_ok < 0) goto fail;                    /* SQL 失败 */
         if (med_ok == 0) { ret = -5; goto fail; }     /* 药品不存在，开不出来 */
 
-        if (stock < used[i]) { ret = -5; goto fail; } /* 库存不足，整张处方回滚 */
+        if (stock < items[i].quantity) { ret = -5; goto fail; } /* 库存不足，整张处方回滚 */
 
         /* 单价快照 + 小计，算好填回结构体，调用方可以直接展示金额 */
         items[i].unit_price = price;
@@ -186,11 +192,11 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
         items[i].detail_id = (int)mysql_insert_id(db->mysql);
         items[i].presc_id  = p->presc_id;
 
-        /* 扣减库存。条件里带上 stock >= used[i]，真正超卖时这里影响 0 行 */
+        /* 扣减库存。条件里带上 stock >= 本行数量，真正超卖时这里影响 0 行 */
         snprintf(buf, sizeof(buf),
                  "UPDATE t_medicine SET stock = stock - %d "
                  "WHERE med_id = %s AND stock >= %d",
-                 items[i].quantity, lit_med, used[i]);
+                 items[i].quantity, lit_med, items[i].quantity);
 
         if (db_execute(db, buf) < 0) goto fail;
 
@@ -384,23 +390,28 @@ void prescription_detail_free(PrescDetail* items) {
  * 内部函数
  * ========================================================================== */
 
-/* 就诊记录是否存在：1 存在，0 不存在，-1 SQL 失败 */
-static int presc_visit_exists(DB_HANDLE* db, int visit_id) {
+/* 查就诊记录：1 存在（回填患者编号和接诊医生编号），0 不存在，-1 SQL 失败 */
+static int presc_fetch_visit(DB_HANDLE* db, int visit_id,
+                             char* out_patient, size_t patient_size,
+                             char* out_doctor, size_t doctor_size) {
     char   buf[256];
     DB_RES* res;
     DB_ROW* row;
-    int    found;
 
     snprintf(buf, sizeof(buf),
-             "SELECT visit_id FROM t_visit_record WHERE visit_id = %d", visit_id);
+             "SELECT patient_id, doctor_id FROM t_visit_record WHERE visit_id = %d",
+             visit_id);
 
     res = db_query(db, buf);
     if (!res) return -1;
 
-    row   = db_fetch_row(res);
-    found = row ? 1 : 0;
+    row = db_fetch_row(res);
+    if (!row) { db_res_free(res); return 0; }
+
+    snprintf(out_patient, patient_size, "%s", col_str(res, row, 0));
+    snprintf(out_doctor,  doctor_size,  "%s", col_str(res, row, 1));
     db_res_free(res);
-    return found;
+    return 1;
 }
 
 /* 查药品当前单价和库存（加行锁）：1 找到，0 没这个药品，-1 SQL 失败 */

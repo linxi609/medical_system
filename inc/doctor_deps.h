@@ -1,41 +1,29 @@
 /* ==========================================================================
- * doctor_deps.h —— 医生模块依赖的跨组函数（仅本次新增）
+ * doctor_deps.h —— 医生模块的补充查询
  * --------------------------------------------------------------------------
  * 负责组：医生组
  * 作者：陈翔宇
  * 创建日期：2026-10-13
  *
- * 【为什么要单独有这个文件】
- *   医生工作台要用到下面几个函数，但它们按 README 的分工不属于医生组：
- *     appointment_query_by_doctor_today  -> M03，患者组的 appointment.c
- *     medicine_query_all / _by_id        -> M06，管理员组的 medicine.c
- *   那两个文件里目前还是空壳（只 return 0），工作台直接调用会拿到空列表。
+ * 【这个文件现在只放什么】
+ *   两条 M07 的补充查询：医生手里只有 visit_id / record_id 时要把病历取出来，
+ *   medical_record.c 的接口里没有这个查询。它们属于医生组自加的新函数，
+ *   不带 -Wredundant-decls 的问题，也不会和别的模块撞名字。
  *
- *   为了"不改别人的文件"，这里把医生组用到的这几个函数放在独立文件
- *   src/doctor_deps.c 里实现，不改 appointment.c / medicine.c 一行。
- *
- * 【函数声明在哪】
- *   被顶替的那几个函数（appointment_query_by_doctor_today、
- *   appointment_list_free、medicine_query_all、medicine_query_by_id、
- *   medicine_list_free）的声明仍然只在 inc/appointment.h 和 inc/medicine.h
- *   里，本文件不重复声明——重复声明除了触发 -Wredundant-decls，
- *   还容易和原文件产生"两处签名各改一半"的隐患。
- *   签名一个字没变，所以以后把实现搬回原文件，调用方完全不用改。
- *
- *   本文件只需要声明医生组自己新加的两条查询（它们不属于任何已有模块）。
- *
- * 【以后患者组 / 管理员组写完了怎么办】
- *   把他们写的实现填回 appointment.c / medicine.c 之后，
- *   删掉本头文件和 src/doctor_deps.c 即可，调用方不用改；
- *   同时记得把 Makefile 里 SRCS 那段的过滤去掉（那里有说明）。
+ * 【历史】本文件最初还声明了一批"顶替"实现（appointment_query_by_doctor_today、
+ *   medicine_query_all 等），因为当时 appointment.c / medicine.c 还是空壳，
+ *   医生工作台拿不到数据。那些函数和原文件里的空壳重复定义，导致整个项目
+ *   链接失败。2026-10-13 经维护者把实现搬回 appointment.c / medicine.c，
+ *   doctor_deps.c 里的重复部分已删除——那两个文件里的函数现在是有实现的，
+ *   直接用 inc/appointment.h、inc/medicine.h 里的声明调用即可。
+ *   （早前版本的本文件注释里提到过"Makefile 里那段过滤"，那个过滤从来没有
+ *     存在过，Makefile 一直是 wildcard 收全部源文件，别再去找它了。）
  * ========================================================================== */
 
 #ifndef DOCTOR_DEPS_H
 #define DOCTOR_DEPS_H
 
 #include "db_mysql.h"
-#include "appointment.h"      /* appointment_query_by_doctor_today / _list_free 的声明 */
-#include "medicine.h"         /* medicine_query_all / _by_id / _list_free 的声明 */
 #include "medical_record.h"
 
 /* --------------------------------------------------------------------------

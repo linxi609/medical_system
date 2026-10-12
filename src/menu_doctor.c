@@ -471,10 +471,40 @@ static void prescription_review(DB_HANDLE* db, const LoginUser* user,
     prescription_list_free(list);
 }
 
+/* --------------------------------------------------------------------------
+ * 在"我的就诊记录"里按 visit_id 找一条就诊，找到则把患者编号拷进 out_patient。
+ * 开处方、写病历时医生手输就诊ID，输入的值必须落在这个列表里，
+ * 否则患者的处方/病历会挂到别人接诊的就诊上。
+ * 返回：1 找到；0 没找到（不存在或不是本人接诊的）
+ * -------------------------------------------------------------------------- */
+static int lookup_my_visit(DB_HANDLE* db, const char* doctor_id, int visit_id,
+                           char* out_patient, size_t out_size) {
+    VisitRecord* list = NULL;
+    int count = 0;
+    int found = 0;
+    int i;
+
+    if (!out_patient || out_size == 0) return 0;
+    out_patient[0] = '\0';
+
+    if (visit_query_by_doctor(db, doctor_id, &list, &count) != 0) return 0;
+
+    for (i = 0; i < count; i++) {
+        if (list[i].visit_id == visit_id) {
+            snprintf(out_patient, out_size, "%s", list[i].patient_id);
+            found = 1;
+            break;
+        }
+    }
+    visit_list_free(list);
+    return found;
+}
+
 /* ==========================================================================
  * 新开一张处方
  * 参数：known_visit_id / known_patient_id  —  刚从接诊流程过来时直接带上，
  *       否则传 0 / NULL，由医生自己填。
+ *       患者编号一律以就诊记录为准，known_patient_id 只用于核对提示。
  * ========================================================================== */
 static void prescription_new(DB_HANDLE* db, const LoginUser* user,
                              int known_visit_id, const char* known_patient_id) {
@@ -501,17 +531,20 @@ static void prescription_new(DB_HANDLE* db, const LoginUser* user,
         printf("\n=== 开处方（就诊ID %d）===\n", p.visit_id);
     }
 
+    /* 患者编号从就诊记录里取，不让医生手输：就诊ID 填成别人的、
+     * 或者患者编号填错一位，都会把处方记到错误的人名下 */
+    if (!lookup_my_visit(db, user->id, p.visit_id, p.patient_id, sizeof(p.patient_id))) {
+        printf("就诊ID %d 不在你的就诊记录里，只能为自己接诊过的就诊开方。\n", p.visit_id);
+        return;
+    }
+    if (known_patient_id && known_patient_id[0] &&
+        strcmp(known_patient_id, p.patient_id) != 0) {
+        printf("提示：该就诊记录里的患者是 %s，已按记录开方。\n", p.patient_id);
+    }
+    printf("患者编号：%s\n", p.patient_id);
+
     prompt("诊断结果：", p.diagnosis, sizeof(p.diagnosis));
 
-    if (known_patient_id && known_patient_id[0]) {
-        snprintf(p.patient_id, sizeof(p.patient_id), "%s", known_patient_id);
-    } else {
-        prompt("患者编号（如 P20260001）：", p.patient_id, sizeof(p.patient_id));
-        if (p.patient_id[0] == '\0') {
-            printf("患者编号不能为空，已取消开处方。\n");
-            return;
-        }
-    }
     copy_str(p.doctor_id, sizeof(p.doctor_id), user->id);
     p.status = 1;
 
@@ -629,6 +662,7 @@ static void do_visit(DB_HANDLE* db, const LoginUser* user) {
     int i;
     int found = 0;
     VisitRecord v;
+    char complaint_default[sizeof(v.chief_complaint)];  /* 挂号症状，主诉直接回车时兜底 */
 
     /* 重新拉一次列表，保证看到的是最新的待就诊情况 */
     ret = appointment_query_by_doctor_today(db, user->id, &list, &count);
@@ -655,6 +689,7 @@ static void do_visit(DB_HANDLE* db, const LoginUser* user) {
     }
 
     memset(&v, 0, sizeof(v));
+    complaint_default[0] = '\0';
     prompt_int("请输入要接诊的预约编号（0 取消）：", &v.appoint_id);
     if (v.appoint_id <= 0) {
         printf("已取消接诊。\n");
@@ -668,6 +703,7 @@ static void do_visit(DB_HANDLE* db, const LoginUser* user) {
             found = 1;
             snprintf(v.patient_id, sizeof(v.patient_id), "%s", list[i].patient_id);
             snprintf(v.chief_complaint, sizeof(v.chief_complaint), "%s", list[i].symptom);
+            snprintf(complaint_default, sizeof(complaint_default), "%s", list[i].symptom);
             break;
         }
     }
@@ -683,6 +719,9 @@ static void do_visit(DB_HANDLE* db, const LoginUser* user) {
     printf("\n=== 接诊：患者 %s，预约 %d ===\n", v.patient_id, v.appoint_id);
     printf("（主诉默认取患者挂号时填的症状，可直接回车沿用）\n");
     prompt("主诉：",            v.chief_complaint, sizeof(v.chief_complaint));
+    /* 直接回车时保留预填的挂号症状——prompt 读到空行会把缓冲区清空，
+     * 不兜这一下的话界面上说"可直接回车沿用"，实际存进去的是空主诉 */
+    keep_or(complaint_default, v.chief_complaint, sizeof(v.chief_complaint));
     prompt("现病史：",          v.present_illness, sizeof(v.present_illness));
     prompt_double("体温(℃)：",  &v.temp);
     prompt("血压(如 120/80)：", v.blood_pressure,  sizeof(v.blood_pressure));
@@ -760,9 +799,6 @@ static void do_my_visits(DB_HANDLE* db, const LoginUser* user) {
  * 4. 书写病历（也可修改本人 24 小时内写过的病历）
  * ========================================================================== */
 static void do_record(DB_HANDLE* db, const LoginUser* user) {
-    VisitRecord* list = NULL;
-    int count = 0;
-    int i;
     int visit_id = 0;
     char patient_id[20] = "";
 
@@ -770,17 +806,7 @@ static void do_record(DB_HANDLE* db, const LoginUser* user) {
     if (visit_id <= 0) return;
 
     /* 患者编号由这条就诊记录决定，先查出来，医生不用手输 */
-    if (visit_query_by_doctor(db, user->id, &list, &count) == 0) {
-        for (i = 0; i < count; i++) {
-            if (list[i].visit_id == visit_id) {
-                snprintf(patient_id, sizeof(patient_id), "%s", list[i].patient_id);
-                break;
-            }
-        }
-        visit_list_free(list);
-    }
-
-    if (patient_id[0] == '\0') {
+    if (!lookup_my_visit(db, user->id, visit_id, patient_id, sizeof(patient_id))) {
         printf("没有找到就诊ID %d，或这条就诊记录不是你的，请核对后重试。\n", visit_id);
         return;
     }
