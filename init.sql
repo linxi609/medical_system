@@ -119,6 +119,9 @@ CREATE TABLE t_medical_record (
 );
 
 -- 预置账号
+-- 登录账号规则：医生、患者的账号由系统生成，就等于各自的编号
+-- （医生 D001 / 患者注册后拿到的 P2026xxxx），不用自己起名、也不复用；
+-- 管理员只有预置的 admin 一个。
 INSERT INTO t_admin VALUES ('A001', '系统管理员', 'admin', '123456', '');
 INSERT INTO t_doctor VALUES ('D001', '张医生', '男', '主治医师', '内科', '', 'D001', '123456', 1);
 INSERT INTO t_medicine VALUES ('M001', '阿莫西林', '0.25g*24粒', '盒', 15.50, 100, '某药厂');

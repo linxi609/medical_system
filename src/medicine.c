@@ -12,6 +12,8 @@
  *   3) 库存预警由调用方（菜单层）按 stock < 50 标注，这里不重复判断。
  *   4) 单条语句无需事务；开方扣库存走 prescription_add 自己的事务，
  *      不经过这里的 medicine_stock_out（见 medicine.h 注释）。
+ *   5) 删除（medicine_delete）是真删，但被 t_presc_detail 引用过的药品
+ *      一律拒绝删除（-6），免得历史处方里的明细对不上号。
  * ========================================================================== */
 
 #include "medicine.h"
@@ -223,6 +225,47 @@ int medicine_update_price(DB_HANDLE* db, const char* med_id, double new_price) {
              "UPDATE t_medicine SET price = %.2f WHERE med_id = %s",
              new_price, lit);
 
+    if (db_execute(db, buf) < 0) return -2;
+    return 0;
+}
+
+/* ==========================================================================
+ * 删除药品
+ * 返回：0 成功；-4 药品不存在；-6 已被历史处方用过，不允许删除；-2 SQL 执行失败
+ *
+ * 删除前先查 t_presc_detail：开过方的药品一旦删掉，历史处方里的明细
+ * 就成了一串查不到来历的编号，所以只要被引用过就拒绝删除。
+ * t_medicine 没有 status 字段，本函数就是真删（DELETE）。
+ * ========================================================================== */
+int medicine_delete(DB_HANDLE* db, const char* med_id) {
+    char buf[256];
+    char esc[MED_ESC_BUF];
+    char* lit;
+    DB_RES* res;
+    int exists;
+
+    if (!db || !db->is_connected) return -1;
+    if (!med_id || !med_id[0]) return -4;
+
+    lit = escape_str(db, med_id, esc, sizeof(esc));
+    if (!lit) return -2;
+
+    exists = med_exists(db, med_id);
+    if (exists < 0) return -2;
+    if (exists == 0) return -4;
+
+    /* 有没有历史处方明细引用它（LIMIT 1，查到一条就够） */
+    snprintf(buf, sizeof(buf),
+             "SELECT detail_id FROM t_presc_detail WHERE med_id = %s LIMIT 1", lit);
+    res = db_query(db, buf);
+    if (!res) return -2;
+    {
+        int used = (db_fetch_row(res) != NULL);
+        db_res_free(res);
+        if (used) return -6;
+    }
+
+    snprintf(buf, sizeof(buf), "DELETE FROM t_medicine WHERE med_id = %s", lit);
     if (db_execute(db, buf) < 0) return -2;
     return 0;
 }

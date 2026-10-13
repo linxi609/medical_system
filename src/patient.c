@@ -13,7 +13,9 @@
  *      按 -3 处理即可。
  *   2) 注销是软删除（status=0），唯一键（username/id_card）不释放，
  *      所以查询患者时一律带上 status=1 才算"在册"。
- *   3) 所有外部输入拼进 SQL 前都过 escape_str() 转义。
+ *   3) 登录账号（username）不由患者自己填，直接取患者编号：编号由系统生成、
+ *      不会重复，注销后账号继续占着位子也就不是问题了（编号本来就不该复用）。
+ *   4) 所有外部输入拼进 SQL 前都过 escape_str() 转义。
  * ========================================================================== */
 
 #include "patient.h"
@@ -109,6 +111,11 @@ int patient_register(DB_HANDLE* db, Patient* p) {
         if (!year[0]) return -2;
         snprintf(p->patient_id, sizeof(p->patient_id), "P%s%04d", year, seq);
     }
+
+    /* ---------- 登录账号 = 患者编号 ----------
+     * 不让患者自己起账号名：编号是系统生成的、天然唯一，也就不存在
+     * "注销后账号还被占着、同名注册不进来"的问题（编号本来就不该复用）。 */
+    snprintf(p->username, sizeof(p->username), "%s", p->patient_id);
 
     /* ---------- 转义各字段 ---------- */
     if (!escape_str(db, p->name,     esc_name,   sizeof(esc_name)))   return -2;
@@ -278,7 +285,8 @@ int patient_delete(DB_HANDLE* db, const char* patient_id) {
 
 /* ==========================================================================
  * 导出患者列表到文本文件
- * 返回：0 成功；-2 查询或写文件失败
+ * 返回：0 成功；-2 查询失败；-3 写文件失败（目录不存在、没权限等）
+ * 说明：查询失败和写文件失败分开报，菜单层才能给出"到底哪一步错了"的提示
  * ========================================================================== */
 int patient_export(DB_HANDLE* db, const char* filename) {
     Patient* list = NULL;
@@ -288,7 +296,7 @@ int patient_export(DB_HANDLE* db, const char* filename) {
     int      i;
 
     if (!db || !db->is_connected) return -1;
-    if (!filename || !filename[0]) return -2;
+    if (!filename || !filename[0]) return -3;
 
     ret = patient_query_all(db, &list, &count);
     if (ret != 0) return -2;
@@ -296,7 +304,7 @@ int patient_export(DB_HANDLE* db, const char* filename) {
     fp = fopen(filename, "w");
     if (!fp) {
         patient_list_free(list);
-        return -2;
+        return -3;
     }
 
     fprintf(fp, "患者编号\t姓名\t性别\t年龄\t身份证号\t电话\t住址\t注册时间\t状态\n");
@@ -310,7 +318,7 @@ int patient_export(DB_HANDLE* db, const char* filename) {
 
     if (fclose(fp) != 0) {
         patient_list_free(list);
-        return -2;
+        return -3;                     /* 写盘出错（磁盘满、配额等） */
     }
     patient_list_free(list);
     return 0;

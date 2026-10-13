@@ -40,6 +40,7 @@
 #include "medicine.h"
 #include "appointment.h"
 #include "doctor_deps.h"
+#include "utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,11 +74,20 @@ static int read_line(char* buf, int size) {
     return 0;
 }
 
-/* 显示提示语后读一整行字符串 */
+/* 显示提示语后读一整行字符串。
+ * 读到不是合法 UTF-8 的字节就重问：这种输入原样发给 MySQL 会被拒
+ * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。 */
 static void prompt(const char* label, char* buf, int size) {
-    printf("%s", label);
-    fflush(stdout);
-    if (read_line(buf, size) != 0) buf[0] = '\0';
+    for (;;) {
+        printf("%s", label);
+        fflush(stdout);
+        if (read_line(buf, size) != 0) { buf[0] = '\0'; return; }
+        if (utf8_valid(buf)) return;
+        printf("输入里含有非 UTF-8 的字节，MySQL 会拒绝这样的内容。常见原因有两个：\n"
+               "  1) 当前终端/粘贴内容的编码不是 UTF-8 —— 确认 locale 里带 UTF-8；\n"
+               "  2) 这一行太长，被输入缓冲区截断，末尾正好切在汉字中间 —— 请分短一些。\n"
+               "请修改后重新输入：\n");
+    }
 }
 
 /* 显示提示语后读一个整数 */
@@ -196,14 +206,18 @@ static int show_today(DB_HANDLE* db, const char* doctor_id) {
         printf("  （今天没有待就诊的预约）\n");
     } else {
         for (i = 0; i < count; i++) {
-            char slot[sizeof(list[i].time_slot)];
-            char symptom[sizeof(list[i].symptom)];
+            char        slot[sizeof(list[i].time_slot)];
+            char        symptom[sizeof(list[i].symptom)];
+            char        id_txt[16];
+            const int   w[] = {8, 6, 12, 0};
+            const char* cells[4];
 
-            printf("  [%d] %-6s %-12s %s\n",
-                   list[i].appoint_id,
-                   one_line_placeholder(list[i].time_slot, slot, sizeof(slot), "未填时段"),
-                   list[i].patient_id,
-                   one_line_placeholder(list[i].symptom, symptom, sizeof(symptom), "未填症状"));
+            snprintf(id_txt, sizeof(id_txt), "[%d]", list[i].appoint_id);
+            cells[0] = id_txt;
+            cells[1] = one_line_placeholder(list[i].time_slot, slot, sizeof(slot), "未填时段");
+            cells[2] = list[i].patient_id;
+            cells[3] = one_line_placeholder(list[i].symptom, symptom, sizeof(symptom), "未填症状");
+            table_row(cells, w, 4);
         }
     }
     printf("----------------------------------------\n");
@@ -232,14 +246,33 @@ static void do_medicine_list(DB_HANDLE* db) {
         return;
     }
 
-    printf("  %-10s %-16s %-14s %6s %8s %7s  %s\n",
-           "药品编号", "名称", "规格", "单位", "单价", "库存", "厂家");
-    for (i = 0; i < count; i++) {
-        printf("  %-10s %-16s %-14s %6s %8.2f %7d  %s%s\n",
-               list[i].med_id, list[i].med_name, list[i].spec, list[i].unit,
-               list[i].price, list[i].stock,
-               list[i].manufacturer,
-               list[i].stock < 50 ? "  [库存不足]" : "");
+    {
+        /* 列宽按【显示列】算：汉字占 2 列。负数 = 右对齐 */
+        const int   w[] = {10, 18, 16, -6, -8, -7, 0};
+        const char* cells[7];
+        char        price_txt[16];
+        char        stock_txt[16];
+        char        man_txt[160];
+
+        cells[0] = "药品编号"; cells[1] = "名称"; cells[2] = "规格";
+        cells[3] = "单位";     cells[4] = "单价"; cells[5] = "库存";
+        cells[6] = "厂家";
+        table_row(cells, w, 7);
+
+        for (i = 0; i < count; i++) {
+            snprintf(price_txt, sizeof(price_txt), "%.2f", list[i].price);
+            snprintf(stock_txt, sizeof(stock_txt), "%d",   list[i].stock);
+            snprintf(man_txt,   sizeof(man_txt),   "%s%s", list[i].manufacturer,
+                     list[i].stock < 50 ? "  [库存不足]" : "");
+            cells[0] = list[i].med_id;
+            cells[1] = list[i].med_name;
+            cells[2] = list[i].spec;
+            cells[3] = list[i].unit;
+            cells[4] = price_txt;
+            cells[5] = stock_txt;
+            cells[6] = man_txt;
+            table_row(cells, w, 7);
+        }
     }
 
     medicine_list_free(list);
@@ -345,6 +378,32 @@ static void write_record(DB_HANDLE* db, const LoginUser* user,
  * 处方：查看明细 / 作废
  * ========================================================================== */
 
+/* 打印处方明细表（开方成功后、查看处方明细都用它，列宽只需维护一处） */
+static void print_presc_items(const PrescDetail* items, int count) {
+    const int   w[] = {12, -6, -10, -12, 0};
+    const char* cells[5];
+    char        qty_txt[16];
+    char        price_txt[16];
+    char        sub_txt[16];
+    int         i;
+
+    cells[0] = "药品编号"; cells[1] = "数量"; cells[2] = "单价";
+    cells[3] = "小计";     cells[4] = "用法";
+    table_row(cells, w, 5);
+
+    for (i = 0; i < count; i++) {
+        snprintf(qty_txt,   sizeof(qty_txt),   "%d",   items[i].quantity);
+        snprintf(price_txt, sizeof(price_txt), "%.2f", items[i].unit_price);
+        snprintf(sub_txt,   sizeof(sub_txt),   "%.2f", items[i].subtotal);
+        cells[0] = items[i].med_id;
+        cells[1] = qty_txt;
+        cells[2] = price_txt;
+        cells[3] = sub_txt;
+        cells[4] = items[i].dosage[0] ? items[i].dosage : "未填";
+        table_row(cells, w, 5);
+    }
+}
+
 /* 打印一张处方的明细和总金额 */
 static void print_presc_detail(DB_HANDLE* db, int presc_id) {
     Prescription p;
@@ -371,14 +430,8 @@ static void print_presc_detail(DB_HANDLE* db, int presc_id) {
     if (item_count == 0) {
         printf("  （没有明细）\n");
     } else {
-        printf("  %-12s %6s %10s %12s  用法\n", "药品编号", "数量", "单价", "小计");
-        for (i = 0; i < item_count; i++) {
-            printf("  %-12s %6d %10.2f %12.2f  %s\n",
-                   items[i].med_id, items[i].quantity,
-                   items[i].unit_price, items[i].subtotal,
-                   items[i].dosage[0] ? items[i].dosage : "未填");
-            total += items[i].subtotal;
-        }
+        print_presc_items(items, item_count);
+        for (i = 0; i < item_count; i++) total += items[i].subtotal;
         printf("  处方总金额：%.2f 元\n", total);
     }
 
@@ -416,12 +469,26 @@ static void prescription_review(DB_HANDLE* db, const LoginUser* user,
         return;
     }
 
-    printf("  %-8s %-8s %-8s %-10s %s\n", "处方ID", "就诊ID", "状态", "开方医生", "诊断");
-    for (i = 0; i < count; i++) {
-        printf("  %-8d %-8d %-8s %-10s %s\n",
-               list[i].presc_id, list[i].visit_id,
-               presc_status_text(list[i].status), list[i].doctor_id,
-               list[i].diagnosis[0] ? list[i].diagnosis : "（未填）");
+    {
+        const int   w[] = {-8, -8, 8, 10, 0};
+        const char* cells[5];
+        char        presc_txt[16];
+        char        visit_txt[16];
+
+        cells[0] = "处方ID"; cells[1] = "就诊ID"; cells[2] = "状态";
+        cells[3] = "开方医生"; cells[4] = "诊断";
+        table_row(cells, w, 5);
+
+        for (i = 0; i < count; i++) {
+            snprintf(presc_txt, sizeof(presc_txt), "%d", list[i].presc_id);
+            snprintf(visit_txt, sizeof(visit_txt), "%d", list[i].visit_id);
+            cells[0] = presc_txt;
+            cells[1] = visit_txt;
+            cells[2] = presc_status_text(list[i].status);
+            cells[3] = list[i].doctor_id;
+            cells[4] = list[i].diagnosis[0] ? list[i].diagnosis : "（未填）";
+            table_row(cells, w, 5);
+        }
     }
 
     /* 明细和作废都按处方 ID 操作，这里循环处理，避免医生反复进退菜单 */
@@ -604,14 +671,8 @@ static void prescription_new(DB_HANDLE* db, const LoginUser* user,
     if (ret == 0) {
         double total = 0.0;
         printf("\n开方成功，处方ID %d\n", p.presc_id);
-        printf("  %-12s %6s %10s %12s  用法\n", "药品编号", "数量", "单价", "小计");
-        for (i = 0; i < item_count; i++) {
-            printf("  %-12s %6d %10.2f %12.2f  %s\n",
-                   items[i].med_id, items[i].quantity,
-                   items[i].unit_price, items[i].subtotal,
-                   items[i].dosage[0] ? items[i].dosage : "未填");
-            total += items[i].subtotal;
-        }
+        print_presc_items(items, item_count);
+        for (i = 0; i < item_count; i++) total += items[i].subtotal;
         printf("处方总金额：%.2f 元\n", total);
         printf("对应药品库存已扣减。\n");
     } else if (ret == -5) {
@@ -678,14 +739,18 @@ static void do_visit(DB_HANDLE* db, const LoginUser* user) {
 
     printf("\n--- 待就诊预约 ---\n");
     for (i = 0; i < count; i++) {
-        char slot[sizeof(list[i].time_slot)];
-        char symptom[sizeof(list[i].symptom)];
+        char        slot[sizeof(list[i].time_slot)];
+        char        symptom[sizeof(list[i].symptom)];
+        char        id_txt[16];
+        const int   w[] = {8, 6, 12, 0};
+        const char* cells[4];
 
-        printf("  [%d] %-6s %-12s %s\n",
-               list[i].appoint_id,
-               one_line_placeholder(list[i].time_slot, slot, sizeof(slot), "未填时段"),
-               list[i].patient_id,
-               one_line_placeholder(list[i].symptom, symptom, sizeof(symptom), "未填症状"));
+        snprintf(id_txt, sizeof(id_txt), "[%d]", list[i].appoint_id);
+        cells[0] = id_txt;
+        cells[1] = one_line_placeholder(list[i].time_slot, slot, sizeof(slot), "未填时段");
+        cells[2] = list[i].patient_id;
+        cells[3] = one_line_placeholder(list[i].symptom, symptom, sizeof(symptom), "未填症状");
+        table_row(cells, w, 4);
     }
 
     memset(&v, 0, sizeof(v));

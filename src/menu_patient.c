@@ -29,6 +29,7 @@
 #include "visit.h"
 #include "prescription.h"
 #include "medical_record.h"
+#include "utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,11 +58,20 @@ static int read_line(char* buf, int size) {
     return 0;
 }
 
-/* 显示提示语后读一整行字符串 */
+/* 显示提示语后读一整行字符串。
+ * 读到不是合法 UTF-8 的字节就重问：这种输入原样发给 MySQL 会被拒
+ * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。 */
 static void prompt(const char* label, char* buf, int size) {
-    printf("%s", label);
-    fflush(stdout);
-    if (read_line(buf, size) != 0) buf[0] = '\0';
+    for (;;) {
+        printf("%s", label);
+        fflush(stdout);
+        if (read_line(buf, size) != 0) { buf[0] = '\0'; return; }
+        if (utf8_valid(buf)) return;
+        printf("输入里含有非 UTF-8 的字节，MySQL 会拒绝这样的内容。常见原因有两个：\n"
+               "  1) 当前终端/粘贴内容的编码不是 UTF-8 —— 确认 locale 里带 UTF-8；\n"
+               "  2) 这一行太长，被输入缓冲区截断，末尾正好切在汉字中间 —— 请分短一些。\n"
+               "请修改后重新输入：\n");
+    }
 }
 
 /* 显示提示语后读一个整数 */
@@ -154,12 +164,25 @@ static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
     }
 
     printf("\n=== 可预约医生 ===\n");
-    printf("  %-4s %-8s %-10s %-6s %-10s %s\n",
-           "序号", "编号", "姓名", "性别", "职称", "科室");
-    for (i = 0; i < count; i++) {
-        printf("  %-4d %-8s %-10s %-6s %-10s %s\n",
-               i + 1, doctors[i].doctor_id, doctors[i].name,
-               doctors[i].gender, doctors[i].title, doctors[i].dept);
+    {
+        const int   w[] = {-4, 10, 12, 6, 12, 0};
+        const char* cells[6];
+        char        seq_txt[16];
+
+        cells[0] = "序号"; cells[1] = "编号"; cells[2] = "姓名";
+        cells[3] = "性别"; cells[4] = "职称"; cells[5] = "科室";
+        table_row(cells, w, 6);
+
+        for (i = 0; i < count; i++) {
+            snprintf(seq_txt, sizeof(seq_txt), "%d", i + 1);
+            cells[0] = seq_txt;
+            cells[1] = doctors[i].doctor_id;
+            cells[2] = doctors[i].name;
+            cells[3] = doctors[i].gender;
+            cells[4] = doctors[i].title;
+            cells[5] = doctors[i].dept;
+            table_row(cells, w, 6);
+        }
     }
 
     prompt_int("请选择医生序号（0 取消）：", &pick);
@@ -234,13 +257,25 @@ static void do_my_appointments(DB_HANDLE* db, const LoginUser* user) {
         return;
     }
 
-    printf("  %-8s %-8s %-12s %-6s %-8s %s\n",
-           "预约ID", "医生", "日期", "时段", "状态", "症状");
-    for (i = 0; i < count; i++) {
-        printf("  %-8d %-8s %-12s %-6s %-8s %s\n",
-               list[i].appoint_id, list[i].doctor_id, list[i].appoint_date,
-               list[i].time_slot, appoint_status_text(list[i].status),
-               list[i].symptom[0] ? list[i].symptom : "（未填）");
+    {
+        const int   w[] = {-8, 10, 12, 6, 8, 0};
+        const char* cells[6];
+        char        id_txt[16];
+
+        cells[0] = "预约ID"; cells[1] = "医生"; cells[2] = "日期";
+        cells[3] = "时段";   cells[4] = "状态"; cells[5] = "症状";
+        table_row(cells, w, 6);
+
+        for (i = 0; i < count; i++) {
+            snprintf(id_txt, sizeof(id_txt), "%d", list[i].appoint_id);
+            cells[0] = id_txt;
+            cells[1] = list[i].doctor_id;
+            cells[2] = list[i].appoint_date;
+            cells[3] = list[i].time_slot;
+            cells[4] = appoint_status_text(list[i].status);
+            cells[5] = list[i].symptom[0] ? list[i].symptom : "（未填）";
+            table_row(cells, w, 6);
+        }
     }
 
     /* 循环处理取消，免得每取消一条都要重进一次菜单 */
@@ -343,14 +378,27 @@ static void do_my_prescriptions(DB_HANDLE* db, const LoginUser* user) {
         return;
     }
 
-    printf("  %-8s %-8s %-8s %-10s %-20s %s\n",
-           "处方ID", "就诊ID", "状态", "开方医生", "开方时间", "诊断");
-    for (i = 0; i < count; i++) {
-        printf("  %-8d %-8d %-8s %-10s %-20s %s\n",
-               list[i].presc_id, list[i].visit_id,
-               presc_status_text(list[i].status), list[i].doctor_id,
-               list[i].create_time[0] ? list[i].create_time : "未知",
-               list[i].diagnosis[0] ? list[i].diagnosis : "（未填）");
+    {
+        const int   w[] = {-8, -8, 8, 10, 22, 0};
+        const char* cells[6];
+        char        presc_txt[16];
+        char        visit_txt[16];
+
+        cells[0] = "处方ID"; cells[1] = "就诊ID"; cells[2] = "状态";
+        cells[3] = "开方医生"; cells[4] = "开方时间"; cells[5] = "诊断";
+        table_row(cells, w, 6);
+
+        for (i = 0; i < count; i++) {
+            snprintf(presc_txt, sizeof(presc_txt), "%d", list[i].presc_id);
+            snprintf(visit_txt, sizeof(visit_txt), "%d", list[i].visit_id);
+            cells[0] = presc_txt;
+            cells[1] = visit_txt;
+            cells[2] = presc_status_text(list[i].status);
+            cells[3] = list[i].doctor_id;
+            cells[4] = list[i].create_time[0] ? list[i].create_time : "未知";
+            cells[5] = list[i].diagnosis[0] ? list[i].diagnosis : "（未填）";
+            table_row(cells, w, 6);
+        }
     }
 
     /* 输入处方ID看明细 */
@@ -391,12 +439,26 @@ static void do_my_prescriptions(DB_HANDLE* db, const LoginUser* user) {
             if (item_count == 0) {
                 printf("  （没有明细）\n");
             } else {
-                printf("  %-12s %6s %10s %12s  用法\n", "药品编号", "数量", "单价", "小计");
+                const int   w[] = {12, -6, -10, -12, 0};
+                const char* cells[5];
+                char        qty_txt[16];
+                char        price_txt[16];
+                char        sub_txt[16];
+
+                cells[0] = "药品编号"; cells[1] = "数量"; cells[2] = "单价";
+                cells[3] = "小计";     cells[4] = "用法";
+                table_row(cells, w, 5);
+
                 for (j = 0; j < item_count; j++) {
-                    printf("  %-12s %6d %10.2f %12.2f  %s\n",
-                           items[j].med_id, items[j].quantity,
-                           items[j].unit_price, items[j].subtotal,
-                           items[j].dosage[0] ? items[j].dosage : "未填");
+                    snprintf(qty_txt,   sizeof(qty_txt),   "%d",    items[j].quantity);
+                    snprintf(price_txt, sizeof(price_txt), "%.2f",  items[j].unit_price);
+                    snprintf(sub_txt,   sizeof(sub_txt),   "%.2f",  items[j].subtotal);
+                    cells[0] = items[j].med_id;
+                    cells[1] = qty_txt;
+                    cells[2] = price_txt;
+                    cells[3] = sub_txt;
+                    cells[4] = items[j].dosage[0] ? items[j].dosage : "未填";
+                    table_row(cells, w, 5);
                     total += items[j].subtotal;
                 }
                 printf("  处方总金额：%.2f 元\n", total);
@@ -461,6 +523,7 @@ static void do_profile(DB_HANDLE* db, const LoginUser* user) {
     printf("  1. 修改联系方式（电话/住址）\n");
     printf("  2. 修改登录密码\n");
     printf("  0. 返回\n");
+    printf("请输入选项[0-2]：");
 
     {
         int choice = 0;

@@ -15,7 +15,7 @@
  *   5. 处方查询      -> prescription_query_all
  *   6. 药品管理      -> medicine_query_all / medicine_query_by_id /
  *                       medicine_add / medicine_stock_in / medicine_stock_out /
- *                       medicine_update_price
+ *                       medicine_update_price / medicine_delete
  *   7. 病历查询      -> medical_record_query_all
  *   8. 修改密码      -> user_change_password
  *   0. 退出系统
@@ -36,10 +36,13 @@
 #include "visit.h"
 #include "prescription.h"
 #include "medical_record.h"
+#include "utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 /* ==========================================================================
  * 输入辅助（写法参照 src/main.c 里的 read_line / prompt）
@@ -63,11 +66,20 @@ static int read_line(char* buf, int size) {
     return 0;
 }
 
-/* 显示提示语后读一整行字符串 */
+/* 显示提示语后读一整行字符串。
+ * 读到不是合法 UTF-8 的字节就重问：这种输入原样发给 MySQL 会被拒
+ * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。 */
 static void prompt(const char* label, char* buf, int size) {
-    printf("%s", label);
-    fflush(stdout);
-    if (read_line(buf, size) != 0) buf[0] = '\0';
+    for (;;) {
+        printf("%s", label);
+        fflush(stdout);
+        if (read_line(buf, size) != 0) { buf[0] = '\0'; return; }
+        if (utf8_valid(buf)) return;
+        printf("输入里含有非 UTF-8 的字节，MySQL 会拒绝这样的内容。常见原因有两个：\n"
+               "  1) 当前终端/粘贴内容的编码不是 UTF-8 —— 确认 locale 里带 UTF-8；\n"
+               "  2) 这一行太长，被输入缓冲区截断，末尾正好切在汉字中间 —— 请分短一些。\n"
+               "请修改后重新输入：\n");
+    }
 }
 
 /* 显示提示语后读一个整数 */
@@ -153,13 +165,28 @@ static void patient_list(DB_HANDLE* db) {
         return;
     }
 
-    printf("  %-12s %-10s %-4s %4s  %-18s %-14s  %s\n",
-           "患者编号", "姓名", "性别", "年龄", "身份证号", "电话", "状态");
-    for (i = 0; i < count; i++) {
-        printf("  %-12s %-10s %-4s %4d  %-18s %-14s  %s\n",
-               list[i].patient_id, list[i].name, list[i].gender, list[i].age,
-               list[i].id_card, list[i].phone,
-               list[i].status == 1 ? "正常" : "已注销");
+    {
+        /* 列宽按【显示列】算：汉字占 2 列。负数 = 右对齐 */
+        const int   w[] = {12, 12, 4, -4, 20, 14, 0};
+        const char* cells[7];
+        char        age_txt[8];
+
+        cells[0] = "患者编号"; cells[1] = "姓名";  cells[2] = "性别";
+        cells[3] = "年龄";     cells[4] = "身份证号"; cells[5] = "电话";
+        cells[6] = "状态";
+        table_row(cells, w, 7);
+
+        for (i = 0; i < count; i++) {
+            snprintf(age_txt, sizeof(age_txt), "%d", list[i].age);
+            cells[0] = list[i].patient_id;
+            cells[1] = list[i].name;
+            cells[2] = list[i].gender;
+            cells[3] = age_txt;
+            cells[4] = list[i].id_card;
+            cells[5] = list[i].phone;
+            cells[6] = list[i].status == 1 ? "正常" : "已注销";
+            table_row(cells, w, 7);
+        }
     }
 
     patient_list_free(list);
@@ -244,9 +271,50 @@ static void patient_delete_flow(DB_HANDLE* db) {
     }
 }
 
+/* 准备导出路径：目录不存在就建出来，建不出来或写不进去就退回当前目录的同名文件。
+ * 成功时把最终要用的路径写进 actual 并返回 0；两个方案都不可写返回 -1。
+ *
+ * 为什么需要这一步：程序通常在 bin/ 目录下运行，那里没有 data/ 子目录，
+ * 直接 fopen("data/patients_export.txt") 会失败 —— 而失败原因只有一句
+ * "SQL 执行失败"，看不出是目录不存在。 */
+static int prepare_out_path(const char* path, char* actual, size_t actualsz) {
+    char        dir[128];
+    char        base[64];
+    const char* slash;
+    struct stat st;
+    FILE*       fp;
+
+    snprintf(actual, actualsz, "%s", path);
+
+    fp = fopen(actual, "a");             /* 原路径能直接写就行（探路用 "a"，别清掉已存在的文件） */
+    if (fp) { fclose(fp); return 0; }
+
+    slash = strrchr(path, '/');
+    if (!slash || slash == path) return -1;   /* 没有目录部分（或根目录），没得退回 */
+
+    if ((size_t)(slash - path) >= sizeof(dir)) return -1;
+    snprintf(dir,  sizeof(dir),  "%.*s", (int)(slash - path), path);
+    snprintf(base, sizeof(base), "%s", slash + 1);
+    if (base[0] == '\0') return -1;
+
+    /* 目录不存在（stat 失败）就建一层出来，再试一次 */
+    if (stat(dir, &st) != 0 && mkdir(dir, 0755) == 0) {
+        fp = fopen(actual, "a");
+        if (fp) { fclose(fp); return 0; }
+    }
+
+    /* 目录建不出来或建了仍然写不进去：退回当前目录的同名文件 */
+    snprintf(actual, actualsz, "%s", base);
+    fp = fopen(actual, "a");
+    if (fp) { fclose(fp); return 0; }
+
+    return -1;
+}
+
 /* 导出患者列表到文本文件 */
 static void patient_export_flow(DB_HANDLE* db) {
     char filename[128];
+    char actual[256];
     int ret;
 
     prompt("导出文件名（直接回车用默认 data/patients_export.txt）：",
@@ -255,9 +323,22 @@ static void patient_export_flow(DB_HANDLE* db) {
         snprintf(filename, sizeof(filename), "data/patients_export.txt");
     }
 
-    ret = patient_export(db, filename);
+    if (prepare_out_path(filename, actual, sizeof(actual)) != 0) {
+        printf("导出失败：路径 %s 写不进去（目录不存在且建不出来，"
+               "当前目录也写不了）\n", filename);
+        return;
+    }
+
+    ret = patient_export(db, actual);
     if (ret == 0) {
-        printf("已导出到 %s\n", filename);
+        /* 打印绝对路径：程序常在 bin/ 下运行，只说相对路径容易让人找不到文件 */
+        char full[512];
+        if (strcmp(actual, filename) != 0) {
+            printf("%s 写不进去，已改为导出到当前目录的 %s\n", filename, actual);
+        }
+        printf("已导出到 %s\n", realpath(actual, full) ? full : actual);
+    } else if (ret == -3) {
+        printf("导出失败：写文件出错（%s）\n", actual);
     } else {
         printf("导出失败：%s\n", err_text(ret));
     }
@@ -321,13 +402,25 @@ static void doctor_list(DB_HANDLE* db) {
         return;
     }
 
-    printf("  %-8s %-10s %-4s %-12s %-10s %-14s  %s\n",
-           "医生编号", "姓名", "性别", "职称", "科室", "电话", "状态");
-    for (i = 0; i < count; i++) {
-        printf("  %-8s %-10s %-4s %-12s %-10s %-14s  %s\n",
-               list[i].doctor_id, list[i].name, list[i].gender, list[i].title,
-               list[i].dept, list[i].phone,
-               list[i].status == 1 ? "在职" : "离职");
+    {
+        const int   w[] = {10, 12, 4, 12, 12, 14, 0};
+        const char* cells[7];
+
+        cells[0] = "医生编号"; cells[1] = "姓名"; cells[2] = "性别";
+        cells[3] = "职称";     cells[4] = "科室"; cells[5] = "电话";
+        cells[6] = "状态";
+        table_row(cells, w, 7);
+
+        for (i = 0; i < count; i++) {
+            cells[0] = list[i].doctor_id;
+            cells[1] = list[i].name;
+            cells[2] = list[i].gender;
+            cells[3] = list[i].title;
+            cells[4] = list[i].dept;
+            cells[5] = list[i].phone;
+            cells[6] = list[i].status == 1 ? "在职" : "离职";
+            table_row(cells, w, 7);
+        }
     }
 
     doctor_list_free(list);
@@ -377,14 +470,13 @@ static void doctor_add_flow(DB_HANDLE* db) {
     prompt("职称(如 主治医师)：", d.title, sizeof(d.title));
     prompt("科室(如 内科)：",  d.dept,     sizeof(d.dept));
     prompt("联系电话：",       d.phone,    sizeof(d.phone));
-    prompt("登录账号：",       d.username, sizeof(d.username));
     prompt("登录密码：",       d.password, sizeof(d.password));
 
     ret = doctor_add(db, &d);
     if (ret == 0) {
-        printf("新增成功，医生编号 %s\n", d.doctor_id);
+        printf("新增成功，医生编号 %s（登录账号）\n", d.doctor_id);
     } else if (ret == -3) {
-        printf("新增失败：登录账号已存在\n");
+        printf("新增失败：编号或登录账号已存在\n");
     } else {
         printf("新增失败：%s\n", err_text(ret));
     }
@@ -527,14 +619,33 @@ static void medicine_list(DB_HANDLE* db) {
         return;
     }
 
-    printf("  %-10s %-16s %-14s %6s %8s %7s  %s\n",
-           "药品编号", "名称", "规格", "单位", "单价", "库存", "厂家");
-    for (i = 0; i < count; i++) {
-        printf("  %-10s %-16s %-14s %6s %8.2f %7d  %s%s\n",
-               list[i].med_id, list[i].med_name, list[i].spec, list[i].unit,
-               list[i].price, list[i].stock,
-               list[i].manufacturer,
-               list[i].stock < 50 ? "  [库存不足]" : "");
+    {
+        const int   w[] = {10, 18, 16, -6, -8, -7, 0};
+        const char* cells[7];
+        char        price_txt[16];
+        char        stock_txt[16];
+        char        man_txt[160];
+
+        cells[0] = "药品编号"; cells[1] = "名称"; cells[2] = "规格";
+        cells[3] = "单位";     cells[4] = "单价"; cells[5] = "库存";
+        cells[6] = "厂家";
+        table_row(cells, w, 7);
+
+        for (i = 0; i < count; i++) {
+            snprintf(price_txt, sizeof(price_txt), "%.2f", list[i].price);
+            snprintf(stock_txt, sizeof(stock_txt), "%d", list[i].stock);
+            /* 库存预警标注跟在最后一列厂家后面，拼成一个字符串一起打印 */
+            snprintf(man_txt, sizeof(man_txt), "%s%s", list[i].manufacturer,
+                     list[i].stock < 50 ? "  [库存不足]" : "");
+            cells[0] = list[i].med_id;
+            cells[1] = list[i].med_name;
+            cells[2] = list[i].spec;
+            cells[3] = list[i].unit;
+            cells[4] = price_txt;
+            cells[5] = stock_txt;
+            cells[6] = man_txt;
+            table_row(cells, w, 7);
+        }
     }
 
     medicine_list_free(list);
@@ -660,6 +771,33 @@ static void medicine_stock_out_flow(DB_HANDLE* db) {
     }
 }
 
+/* 删除药品（被历史处方引用过的不让删，保住处方明细） */
+static void medicine_delete_flow(DB_HANDLE* db) {
+    char med_id[20];
+    char ans[16];
+    int ret;
+
+    prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
+    if (med_id[0] == '\0' || strcmp(med_id, "0") == 0) return;
+
+    prompt("确认删除该药品？删除后不可恢复。(y/N)：", ans, sizeof(ans));
+    if (ans[0] != 'y' && ans[0] != 'Y') {
+        printf("已取消。\n");
+        return;
+    }
+
+    ret = medicine_delete(db, med_id);
+    if (ret == 0) {
+        printf("药品 %s 已删除。\n", med_id);
+    } else if (ret == -4) {
+        printf("删除失败：药品不存在\n");
+    } else if (ret == -6) {
+        printf("删除失败：该药品已出现在历史处方里，不能删除\n");
+    } else {
+        printf("删除失败：%s\n", err_text(ret));
+    }
+}
+
 /* 调价 */
 static void medicine_price_flow(DB_HANDLE* db) {
     char med_id[20];
@@ -700,8 +838,9 @@ static void do_medicine_menu(DB_HANDLE* db) {
         printf("  4. 入库\n");
         printf("  5. 出库\n");
         printf("  6. 调价\n");
+        printf("  7. 删除药品\n");
         printf("  0. 返回\n");
-        printf("请输入选项[0-6]：");
+        printf("请输入选项[0-7]：");
         fflush(stdout);
 
         r = read_choice(&choice);
@@ -715,6 +854,7 @@ static void do_medicine_menu(DB_HANDLE* db) {
             case 4: medicine_stock_in_flow(db);  break;
             case 5: medicine_stock_out_flow(db); break;
             case 6: medicine_price_flow(db);     break;
+            case 7: medicine_delete_flow(db);    break;
             case 0: running = 0;                 break;
             default: printf("无效选项\n");       break;
         }
@@ -745,15 +885,27 @@ static void do_appointment_query(DB_HANDLE* db) {
         return;
     }
 
-    printf("  %-8s %-12s %-8s %-12s %-6s %-8s  %s\n",
-           "预约ID", "患者编号", "医生编号", "日期", "时段", "状态", "症状");
-    for (i = 0; i < count; i++) {
-        printf("  %-8d %-12s %-8s %-12s %-6s %-8s  %s\n",
-               list[i].appoint_id, list[i].patient_id, list[i].doctor_id,
-               list[i].appoint_date,
-               list[i].time_slot[0] ? list[i].time_slot : "未填",
-               appt_status_text(list[i].status),
-               list[i].symptom[0] ? list[i].symptom : "（未填）");
+    {
+        const int   w[] = {-8, 12, 10, 12, 6, 8, 0};
+        const char* cells[7];
+        char        id_txt[16];
+
+        cells[0] = "预约ID"; cells[1] = "患者编号"; cells[2] = "医生编号";
+        cells[3] = "日期";   cells[4] = "时段";     cells[5] = "状态";
+        cells[6] = "症状";
+        table_row(cells, w, 7);
+
+        for (i = 0; i < count; i++) {
+            snprintf(id_txt, sizeof(id_txt), "%d", list[i].appoint_id);
+            cells[0] = id_txt;
+            cells[1] = list[i].patient_id;
+            cells[2] = list[i].doctor_id;
+            cells[3] = list[i].appoint_date;
+            cells[4] = list[i].time_slot[0] ? list[i].time_slot : "未填";
+            cells[5] = appt_status_text(list[i].status);
+            cells[6] = list[i].symptom[0] ? list[i].symptom : "（未填）";
+            table_row(cells, w, 7);
+        }
     }
 
     appointment_list_free(list);
@@ -817,13 +969,27 @@ static void do_prescription_query(DB_HANDLE* db) {
         return;
     }
 
-    printf("  %-8s %-8s %-12s %-8s %-8s  %s\n",
-           "处方ID", "就诊ID", "患者编号", "医生编号", "状态", "诊断");
-    for (i = 0; i < count; i++) {
-        printf("  %-8d %-8d %-12s %-8s %-8s  %s\n",
-               list[i].presc_id, list[i].visit_id, list[i].patient_id,
-               list[i].doctor_id, presc_status_text(list[i].status),
-               list[i].diagnosis[0] ? list[i].diagnosis : "（未填）");
+    {
+        const int   w[] = {-8, -8, 12, 10, 8, 0};
+        const char* cells[6];
+        char        presc_txt[16];
+        char        visit_txt[16];
+
+        cells[0] = "处方ID"; cells[1] = "就诊ID"; cells[2] = "患者编号";
+        cells[3] = "医生编号"; cells[4] = "状态"; cells[5] = "诊断";
+        table_row(cells, w, 6);
+
+        for (i = 0; i < count; i++) {
+            snprintf(presc_txt, sizeof(presc_txt), "%d", list[i].presc_id);
+            snprintf(visit_txt, sizeof(visit_txt), "%d", list[i].visit_id);
+            cells[0] = presc_txt;
+            cells[1] = visit_txt;
+            cells[2] = list[i].patient_id;
+            cells[3] = list[i].doctor_id;
+            cells[4] = presc_status_text(list[i].status);
+            cells[5] = list[i].diagnosis[0] ? list[i].diagnosis : "（未填）";
+            table_row(cells, w, 6);
+        }
     }
 
     prescription_list_free(list);

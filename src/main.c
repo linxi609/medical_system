@@ -19,6 +19,7 @@
 #include "auth.h"
 #include "patient.h"
 #include "menu.h"
+#include "utils.h"
 
 /* ==========================================================================
  * 输入辅助函数
@@ -46,11 +47,20 @@ static int read_line(char* buf, int size) {
     return 0;
 }
 
-/* 显示提示语后读一整行字符串 */
+/* 显示提示语后读一整行字符串。
+ * 读到不是合法 UTF-8 的字节就重问：这种输入原样发给 MySQL 会被拒
+ * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。 */
 static void prompt(const char* label, char* buf, int size) {
-    printf("%s", label);
-    fflush(stdout);
-    if (read_line(buf, size) != 0) buf[0] = '\0';
+    for (;;) {
+        printf("%s", label);
+        fflush(stdout);
+        if (read_line(buf, size) != 0) { buf[0] = '\0'; return; }
+        if (utf8_valid(buf)) return;
+        printf("输入里含有非 UTF-8 的字节，MySQL 会拒绝这样的内容。常见原因有两个：\n"
+               "  1) 当前终端/粘贴内容的编码不是 UTF-8 —— 确认 locale 里带 UTF-8；\n"
+               "  2) 这一行太长，被输入缓冲区截断，末尾正好切在汉字中间 —— 请分短一些。\n"
+               "请修改后重新输入：\n");
+    }
 }
 
 /* 显示提示语后读一个整数 */
@@ -105,9 +115,14 @@ static void do_login(DB_HANDLE* db) {
     }
     if (role == 0) return;
 
+    /* 账号由系统生成，不是自己起的用户名，这里按身份给一句提示 */
+    if (role == 1)      printf("（管理员账号：admin）\n");
+    else if (role == 2) printf("（医生账号：D 开头的医生编号，如 D001）\n");
+    else                printf("（患者账号：P 开头的患者编号，如 P20260001）\n");
+
     char username[50];
     char password[100];
-    prompt("请输入用户名：", username, sizeof(username));
+    prompt("请输入账号：", username, sizeof(username));
     prompt("请输入密  码：", password, sizeof(password));
 
     LoginUser user;
@@ -127,7 +142,7 @@ static void do_login(DB_HANDLE* db) {
                     break;
             }
             break;
-        case -4: printf("\n用户名或密码错误\n"); break;
+        case -4: printf("\n账号或密码错误\n"); break;
         case -6: printf("\n该账号不属于所选身份\n"); break;
         case -7: printf("\n账号已锁定，或已注销/离职\n"); break;
         default:
@@ -152,14 +167,14 @@ static void do_register(DB_HANDLE* db) {
     prompt("身份证号：", p.id_card,  sizeof(p.id_card));
     prompt("电话：",     p.phone,    sizeof(p.phone));
     prompt("住址：",     p.address,  sizeof(p.address));
-    prompt("登录账号：", p.username, sizeof(p.username));
     prompt("密码：",     p.password, sizeof(p.password));
 
     int ret = user_register_patient(db, &p);
     if (ret == 0) {
-        printf("\n注册成功，您的患者编号是 %s\n", p.patient_id);
+        printf("\n注册成功！\n");
+        printf("  患者编号：%s（登录账号）\n", p.patient_id);
     } else if (ret == -3) {
-        printf("\n注册失败：身份证号或登录账号已被注册\n");
+        printf("\n注册失败：这个身份证号已经注册过了\n");
     } else {
         printf("\n注册失败（错误码 %d）\n", ret);
     }

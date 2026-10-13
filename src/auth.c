@@ -247,26 +247,25 @@ int user_login(DB_HANDLE* db, int role, const char* username,
 
 /* --------------------------------------------------------------------------
  * 患者注册（菜单入口）
- * 说明：本函数只做"账号、身份证号不重复"的校验和提示，
- *       建档入库由 M01 的 patient_register 完成（编号也由它生成回写）
- * 返回：0 成功；-3 身份证号或账号已存在；-2 SQL 执行失败；-1 连接失败
+ * 说明：本函数只做"身份证号不重复"的校验和提示，
+ *       建档入库由 M01 的 patient_register 完成（编号和登录账号都由它生成，
+ *       账号就是编号，不会和别人的重名，所以这里不用再查账号）。
+ *       数据库层的唯一索引仍然兜底，撞了由 patient_register 返回 -3。
+ * 返回：0 成功；-3 身份证号已存在；-2 SQL 执行失败；-1 连接失败
  * -------------------------------------------------------------------------- */
 int user_register_patient(DB_HANDLE* db, Patient* p) {
     if (!db || !db->is_connected) return -1;
     if (!p) return -2;
 
-    char esc_user[128];
     char esc_card[64];
-    if (sql_escape(db, p->username, esc_user, sizeof(esc_user)) != 0) return -2;
-    if (sql_escape(db, p->id_card,  esc_card,  sizeof(esc_card))  != 0) return -2;
+    if (sql_escape(db, p->id_card, esc_card, sizeof(esc_card)) != 0) return -2;
 
-    /* 注销过的账号（status=0）不释放唯一键，所以这里不过滤 status：
+    /* 注销过的患者（status=0）不释放唯一键，所以这里不过滤 status：
      * 还能查到就说明唯一约束会冲突，直接按重复处理 */
     char sql[512];
     snprintf(sql, sizeof(sql),
-             "SELECT patient_id FROM t_patient "
-             "WHERE username='%s' OR id_card='%s' LIMIT 1",
-             esc_user, esc_card);
+             "SELECT patient_id FROM t_patient WHERE id_card='%s' LIMIT 1",
+             esc_card);
 
     DB_RES* res = db_query(db, sql);
     if (!res) return -2;
