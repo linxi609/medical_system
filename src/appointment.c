@@ -55,32 +55,213 @@ static int col_int(DB_RES* res, DB_ROW* row, int idx) {
 }
 
 /* ==========================================================================
- * 患者组负责的函数（还是空壳，等患者组填）
+ * 患者组负责的函数
+ * --------------------------------------------------------------------------
+ * appointment_add    挂号：先拦重复挂号（同患者/同天/同医生，且未取消的），
+ *                    再插入 status=0 的新预约。
+ * appointment_cancel 取消：先查这条预约在不在、是不是本人、是不是待就诊，
+ *                    再 UPDATE status=2（条件里带 status=0，并发下也安全）。
+ * 两个查询共用一个内部函数 appointment_load 装结果集。
  * ========================================================================== */
 
+/* 结果集 -> Appointment 数组（三个查询函数共用；where 传空串表示不加条件） */
+static int appointment_load(DB_HANDLE* db, const char* where,
+                            Appointment** out_list, int* out_count) {
+    char buf[2048];
+    DB_RES* res;
+    DB_ROW* row;
+    Appointment* arr = NULL;
+    int n = 0;
+
+    if (out_list)  *out_list  = NULL;
+    if (out_count) *out_count = 0;
+    if (!db || !db->is_connected) return -1;
+    if (!out_list || !out_count) return -2;
+
+    snprintf(buf, sizeof(buf),
+             "SELECT appoint_id, patient_id, doctor_id, "
+             "DATE_FORMAT(appoint_date, '%%Y-%%m-%%d'), time_slot, symptom, status, "
+             "DATE_FORMAT(create_time, '%%Y-%%m-%%d %%H:%%i:%%s') "
+             "FROM t_appointment %s ORDER BY appoint_id DESC",
+             where ? where : "");
+
+    res = db_query(db, buf);
+    if (!res) return -2;
+
+    if (res->row_cnt > 0) {
+        arr = (Appointment*)malloc(sizeof(Appointment) * (size_t)res->row_cnt);
+        if (!arr) { db_res_free(res); return -2; }
+
+        while ((row = db_fetch_row(res)) != NULL) {
+            Appointment* a;
+
+            /* 双保险：数组按 res->row_cnt 分配，万一结果集比报出来的行数还多，
+             * 宁可少读也不能写越界 */
+            if (n >= res->row_cnt) break;
+
+            a = &arr[n];
+            memset(a, 0, sizeof(*a));
+            a->appoint_id = col_int(res, row, 0);
+            snprintf(a->patient_id,   sizeof(a->patient_id),   "%s", col_str(res, row, 1));
+            snprintf(a->doctor_id,    sizeof(a->doctor_id),    "%s", col_str(res, row, 2));
+            snprintf(a->appoint_date, sizeof(a->appoint_date), "%s", col_str(res, row, 3));
+            snprintf(a->time_slot,    sizeof(a->time_slot),    "%s", col_str(res, row, 4));
+            snprintf(a->symptom,      sizeof(a->symptom),      "%s", col_str(res, row, 5));
+            a->status = col_int(res, row, 6);
+            snprintf(a->create_time,  sizeof(a->create_time),  "%s", col_str(res, row, 7));
+            n++;
+        }
+    }
+    db_res_free(res);
+
+    if (n == 0) { free(arr); arr = NULL; }
+
+    *out_list  = arr;
+    *out_count = n;
+    return 0;
+}
+
+/* 患者挂号
+ * 返回：0 成功；-8 重复挂号；-2 SQL 执行失败；-1 连接失败 */
 int appointment_add(DB_HANDLE* db, Appointment* a) {
-    (void)db; (void)a;
-    return 0;  /* TODO: 校验同一患者同天同医生未重复，插入 t_appointment（status=0） */
+    char buf[2048];
+    char esc_pid[64];
+    char esc_did[64];
+    char esc_date[32];
+    char esc_slot[32];
+    char esc_symptom[448];
+    DB_RES* res;
+
+    if (!db || !db->is_connected) return -1;
+    if (!a) return -2;
+    if (!a->patient_id[0] || !a->doctor_id[0] || !a->appoint_date[0]) return -2;
+
+    if (!escape_str(db, a->patient_id,   esc_pid,     sizeof(esc_pid)))     return -2;
+    if (!escape_str(db, a->doctor_id,    esc_did,     sizeof(esc_did)))     return -2;
+    if (!escape_str(db, a->appoint_date, esc_date,    sizeof(esc_date)))    return -2;
+    if (!escape_str(db, a->time_slot,    esc_slot,    sizeof(esc_slot)))    return -2;
+    if (!escape_str(db, a->symptom,      esc_symptom, sizeof(esc_symptom))) return -2;
+
+    /* ---------- 重复挂号校验 ----------
+     * 同一患者、同一天、同一医生，只要还有未取消的预约（status 0 或 1），
+     * 就算重复。已取消（status=2）的不拦，可以重新挂。 */
+    snprintf(buf, sizeof(buf),
+             "SELECT appoint_id FROM t_appointment "
+             "WHERE patient_id = %s AND doctor_id = %s "
+             "AND appoint_date = %s AND status != 2 LIMIT 1",
+             esc_pid, esc_did, esc_date);
+
+    res = db_query(db, buf);
+    if (!res) return -2;
+    {
+        int dup = (db_fetch_row(res) != NULL);
+        db_res_free(res);
+        if (dup) return -8;
+    }
+
+    /* ---------- 插入（status 固定 0，create_time 走 DEFAULT） ---------- */
+    snprintf(buf, sizeof(buf),
+             "INSERT INTO t_appointment "
+             "(patient_id, doctor_id, appoint_date, time_slot, symptom, status) "
+             "VALUES (%s, %s, %s, %s, %s, 0)",
+             esc_pid, esc_did, esc_date, esc_slot, esc_symptom);
+
+    if (db_execute(db, buf) < 0) return -2;
+
+    a->appoint_id = (int)mysql_insert_id(db->mysql);
+    if (a->appoint_id <= 0) return -2;      /* 拿不到自增主键，说明没插进去 */
+    a->status = 0;
+
+    /* 把数据库认定的挂号时间读回来，供调用方展示 */
+    snprintf(buf, sizeof(buf),
+             "SELECT DATE_FORMAT(create_time, '%%Y-%%m-%%d %%H:%%i:%%s') "
+             "FROM t_appointment WHERE appoint_id = %d", a->appoint_id);
+    res = db_query(db, buf);
+    if (res) {
+        DB_ROW* row = db_fetch_row(res);
+        if (row) {
+            snprintf(a->create_time, sizeof(a->create_time), "%s", col_str(res, row, 0));
+        }
+        db_res_free(res);
+    }
+
+    return 0;
 }
 
+/* 取消预约
+ * 返回：0 成功；-4 预约不存在；-6 不是本人的预约或状态不允许取消；
+ *       -2 SQL 执行失败；-1 连接失败 */
 int appointment_cancel(DB_HANDLE* db, int appoint_id, const char* patient_id) {
-    (void)db; (void)appoint_id; (void)patient_id;
-    return 0;  /* TODO: 校验预约属于该患者且 status=0，再 UPDATE status=2 */
+    char buf[512];
+    char esc[64];
+    DB_RES* res;
+    DB_ROW* row;
+    int affected;
+
+    if (!db || !db->is_connected) return -1;
+    if (appoint_id <= 0) return -4;
+    if (!patient_id || !patient_id[0]) return -6;
+    if (!escape_str(db, patient_id, esc, sizeof(esc))) return -2;
+
+    /* ---------- 先查这条预约：在不在、谁的、什么状态 ----------
+     * 先把 -4 和 -6 区分开，再动手改。 */
+    snprintf(buf, sizeof(buf),
+             "SELECT patient_id, status FROM t_appointment WHERE appoint_id = %d",
+             appoint_id);
+
+    res = db_query(db, buf);
+    if (!res) return -2;
+
+    row = db_fetch_row(res);
+    if (!row) {                                    /* 预约不存在 */
+        db_res_free(res);
+        return -4;
+    }
+    if (strcmp(col_str(res, row, 0), patient_id) != 0) {  /* 列 0 = patient_id */
+        db_res_free(res);
+        return -6;                                 /* 不是本人的预约 */
+    }
+    if (col_int(res, row, 1) != 0) {               /* 列 1 = status */
+        db_res_free(res);
+        return -6;                                 /* 已就诊或已取消，不能再取消 */
+    }
+    db_res_free(res);
+
+    /* ---------- 置为已取消 ----------
+     * 条件里再带一次 status=0：查完到改之间被医生抢先接诊时，这里影响 0 行。 */
+    snprintf(buf, sizeof(buf),
+             "UPDATE t_appointment SET status = 2 "
+             "WHERE appoint_id = %d AND patient_id = %s AND status = 0",
+             appoint_id, esc);
+
+    affected = db_execute(db, buf);
+    if (affected < 0) return -2;
+    if (affected == 0) return -6;      /* 状态已被改动，不再是可取消的待就诊 */
+    return 0;
 }
 
+/* 查询某患者的全部预约 */
 int appointment_query_by_patient(DB_HANDLE* db, const char* patient_id,
                                  Appointment** out_list, int* out_count) {
-    (void)db; (void)patient_id;
+    char where[160];
+    char esc[64];
+
     if (out_list)  *out_list  = NULL;
     if (out_count) *out_count = 0;
-    return 0;  /* TODO: SELECT ... FROM t_appointment WHERE patient_id=? */
+    if (!db || !db->is_connected) return -1;
+    if (!patient_id || !patient_id[0]) return -2;
+
+    if (!escape_str(db, patient_id, esc, sizeof(esc))) return -2;
+    snprintf(where, sizeof(where), "WHERE patient_id = %s", esc);
+    return appointment_load(db, where, out_list, out_count);
 }
 
+/* 查询全部预约（管理员用） */
 int appointment_query_all(DB_HANDLE* db, Appointment** out_list, int* out_count) {
-    (void)db;
     if (out_list)  *out_list  = NULL;
     if (out_count) *out_count = 0;
-    return 0;  /* TODO: SELECT 全部预约（管理员用） */
+    if (!db || !db->is_connected) return -1;
+    return appointment_load(db, "", out_list, out_count);
 }
 
 /* ==========================================================================
