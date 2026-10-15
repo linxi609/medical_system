@@ -23,6 +23,45 @@ int is_all_digit(const char *s) {
     return 1;
 }
 
+/* 是否全部是汉字。空串返回 0（调用方要"必填"时直接拿来判即可）。
+ * 先按 UTF-8 解出码点，再看码点在不在汉字区间里；任何一字节不合规都返回 0。
+ * 汉字最少 3 字节，所以 2 字节序列（含全角标点之外的拉丁扩展、希腊字母等）
+ * 一律不算，ASCII 更不算。 */
+int is_all_chinese(const char *s) {
+    int i = 0;
+
+    if (s == NULL || s[0] == '\0') return 0;
+
+    while (s[i] != '\0') {
+        unsigned char c = (unsigned char)s[i];
+        unsigned int  cp;
+        int           len;
+        int           j;
+
+        if (c < 0x80) return 0;                   /* ASCII：字母、数字、空格都不算 */
+        if      ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+        else return 0;                            /* 2 字节序列里没有汉字，非法首字节同理 */
+
+        for (j = 1; j < len; j++) {
+            unsigned char t = (unsigned char)s[i + j];
+            if (t == '\0')            return 0;   /* 字符串在半截上结束 */
+            if ((t & 0xC0) != 0x80)   return 0;   /* 后继字节不是 10xxxxxx */
+            cp = (cp << 6) | (t & 0x3F);
+        }
+
+        if (!((cp >= 0x4E00 && cp <= 0x9FFF) ||   /* 基本区，常用汉字都在这里 */
+              (cp >= 0x3400 && cp <= 0x4DBF) ||   /* 扩展 A 区 */
+              (cp >= 0xF900 && cp <= 0xFAFF) ||   /* 兼容汉字（含 U+FA00 起的一段）*/
+              (cp >= 0x20000 && cp <= 0x3FFFD))) { /* 扩展 B 区及以后，生僻姓会用 */
+            return 0;
+        }
+
+        i += len;
+    }
+    return 1;
+}
+
 /* 从 s 的当前位置解出一个 UTF-8 字符，*width 回填它占几个显示列，
  * 返回这个字符占几个字节。非法字节按 1 字节、1 列处理（不崩、不卡死）。 */
 static int utf8_next(const char *s, int *width) {

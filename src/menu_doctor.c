@@ -108,7 +108,13 @@ static void prompt_double(const char* label, double* out) {
 static int read_choice(int* out) {
     char buf[32];
     if (read_line(buf, sizeof(buf)) != 0) return -2;
-    if (sscanf(buf, "%d", out) != 1) return -1;
+
+    /* 整行都是数字才算合法，不要用 sscanf("%d")：它会把 "3abc" 读成 3，
+     * 把 "-1" 读成负数，用户以为自己输错了，程序却当成有效选项往下走。
+     * 位数超过 4 位的一定不是菜单序号，顺手挡掉，也避开 atoi 溢出。 */
+    str_trim(buf);
+    if (!is_all_digit(buf) || strlen(buf) > 4) return -1;
+    *out = atoi(buf);
     return 0;
 }
 
@@ -949,7 +955,12 @@ void menu_doctor(DB_HANDLE* db, const LoginUser* user) {
 
         r = read_choice(&choice);
         if (r == -2) return;                     /* 输入结束，直接返回，避免空转 */
-        if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
+        /* 本菜单只有 0-6，别的数字一律当成输入有误，不进 switch：
+         * read_choice 只保证"是个数字"，范围得在这里卡 */
+        if (r != 0 || choice < 0 || choice > 6) {
+            printf("输入有误，请输入 0-6 之间的序号\n");
+            continue;
+        }
 
         switch (choice) {
             case 1: do_visit(db, user);           break;
@@ -959,7 +970,9 @@ void menu_doctor(DB_HANDLE* db, const LoginUser* user) {
             case 5: do_medicine_list(db);         break;
             case 6: do_change_password(db, user); break;
             case 0: running = 0;                  break;
-            default: printf("无效选项\n");        break;
+            /* 上面已经把 0-6 之外的全挡掉了，这里是改菜单时忘了同步
+             * 那句 if 的兜底，免得选项编号对不上却一声不响 */
+            default: printf("输入有误，请输入 0-6 之间的序号\n"); break;
         }
     }
 
