@@ -66,20 +66,30 @@ static int read_line(char* buf, int size) {
     return 0;
 }
 
-/* 显示提示语后读一整行字符串。
+/* 显示提示语后读一整行，并校验它是合法 UTF-8。
+ * 返回 0 成功，-1 读失败/输入结束。
  * 读到不是合法 UTF-8 的字节就重问：这种输入原样发给 MySQL 会被拒
- * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。 */
-static void prompt(const char* label, char* buf, int size) {
+ * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。
+ *
+ * 单独拆出来（而不是直接写在 prompt 里）是为了让下面几个带字段约束的
+ * 输入函数能拿到"输入结束"这个信号 —— 光看缓冲区空不空分不清用户是
+ * "直接回车"还是 stdin 到底了，后者再重问下去就是死循环。 */
+static int read_field(const char* label, char* buf, int size) {
     for (;;) {
         printf("%s", label);
         fflush(stdout);
-        if (read_line(buf, size) != 0) { buf[0] = '\0'; return; }
-        if (utf8_valid(buf)) return;
+        if (read_line(buf, size) != 0) { buf[0] = '\0'; return -1; }
+        if (utf8_valid(buf)) return 0;
         printf("输入里含有非 UTF-8 的字节，MySQL 会拒绝这样的内容。常见原因有两个：\n"
                "  1) 当前终端/粘贴内容的编码不是 UTF-8 —— 确认 locale 里带 UTF-8；\n"
                "  2) 这一行太长，被输入缓冲区截断，末尾正好切在汉字中间 —— 请分短一些。\n"
                "请修改后重新输入：\n");
     }
+}
+
+/* 显示提示语后读一整行字符串（输入结束时按空串返回，由调用方的空值检查兜住） */
+static void prompt(const char* label, char* buf, int size) {
+    (void)read_field(label, buf, size);
 }
 
 /* 显示提示语后读一个整数 */
@@ -96,11 +106,48 @@ static void prompt_double(const char* label, double* out) {
     *out = atof(buf);
 }
 
+/* 显示提示语后读一个只允许汉字的字段，用于性别/职称/科室这类字段。
+ * allow_empty 为 0 表示必填。返回 0 成功，-1 输入结束（调用方应中止本流程） */
+static int prompt_chinese(const char* label, char* buf, int size, int allow_empty) {
+    for (;;) {
+        if (read_field(label, buf, size) != 0) return -1;
+        if (buf[0] == '\0') {
+            if (allow_empty) return 0;
+            printf("此项不能为空，请重新输入。\n");
+            continue;
+        }
+        if (is_all_chinese(buf)) return 0;
+        printf("此项只能填写汉字（不能有字母、数字、空格或标点），请重新输入。\n");
+    }
+}
+
+/* 显示提示语后读一个只允许数字的字段，用于电话号码。
+ * allow_empty 为 1 表示可以留空（档案里本来就可能没登记电话）。
+ * 返回 0 成功，-1 输入结束（调用方应中止本流程） */
+static int prompt_digits(const char* label, char* buf, int size, int allow_empty) {
+    for (;;) {
+        if (read_field(label, buf, size) != 0) return -1;
+        if (buf[0] == '\0') {
+            if (allow_empty) return 0;
+            printf("此项不能为空，请重新输入。\n");
+            continue;
+        }
+        if (is_all_digit(buf)) return 0;
+        printf("此项只能填写数字（不能有空格、横线或字母），请重新输入。\n");
+    }
+}
+
 /* 读一个菜单选项。返回 0 成功，-1 输入非法，-2 输入结束（Ctrl+D 或管道读完） */
 static int read_choice(int* out) {
     char buf[32];
     if (read_line(buf, sizeof(buf)) != 0) return -2;
-    if (sscanf(buf, "%d", out) != 1) return -1;
+
+    /* 整行都是数字才算合法，不要用 sscanf("%d")：它会把 "3abc" 读成 3，
+     * 把 "-1" 读成负数，用户以为自己输错了，程序却当成有效选项往下走。
+     * 位数超过 4 位的一定不是菜单序号，顺手挡掉，也避开 atoi 溢出。 */
+    str_trim(buf);
+    if (!is_all_digit(buf) || strlen(buf) > 4) return -1;
+    *out = atoi(buf);
     return 0;
 }
 
@@ -465,12 +512,22 @@ static void doctor_add_flow(DB_HANDLE* db) {
     d.status = 1;
 
     printf("\n=== 新增医生 ===\n");
-    prompt("姓名：",           d.name,     sizeof(d.name));
-    prompt("性别(男/女)：",    d.gender,   sizeof(d.gender));
-    prompt("职称(如 主治医师)：", d.title, sizeof(d.title));
-    prompt("科室(如 内科)：",  d.dept,     sizeof(d.dept));
-    prompt("联系电话：",       d.phone,    sizeof(d.phone));
-    prompt("登录密码：",       d.password, sizeof(d.password));
+    prompt("姓名：", d.name, sizeof(d.name));
+
+    /* 性别/职称/科室只收汉字，电话只收数字：这几项要显示在医生列表和挂号
+     * 的选医生界面上，混进字母数字既会让表格列宽对不上，也没法按科室筛。
+     * 性别必填（列表里直接打印，没有"未填"的兜底），职称/科室和电话允许
+     * 留空。任何一项读到输入结束（Ctrl+D / 管道读完）就整单取消，
+     * 不能接着问 —— 否则后面的字段会被当成上一次的答案收进去。 */
+    if (prompt_chinese("性别(男/女)：",       d.gender, sizeof(d.gender), 0) != 0 ||
+        prompt_chinese("职称(如 主治医师)：", d.title,  sizeof(d.title),  1) != 0 ||
+        prompt_chinese("科室(如 内科)：",     d.dept,   sizeof(d.dept),   1) != 0 ||
+        prompt_digits ("联系电话：",          d.phone,  sizeof(d.phone),  1) != 0) {
+        printf("输入结束，已取消新增。\n");
+        return;
+    }
+
+    prompt("登录密码：", d.password, sizeof(d.password));
 
     ret = doctor_add(db, &d);
     if (ret == 0) {
@@ -514,9 +571,15 @@ static void doctor_update_flow(DB_HANDLE* db) {
     snprintf(dept,  sizeof(dept),  "%s", d.dept);
     snprintf(phone, sizeof(phone), "%s", d.phone);
 
-    prompt("职称(如 主治医师)：", title, sizeof(title));
-    prompt("科室(如 内科)：",     dept,  sizeof(dept));
-    prompt("联系电话：",          phone, sizeof(phone));
+    /* 改的是同一批字段，约束和新增时一致。区别是这里留空表示保留原值，
+     * 所以都允许空 —— 填了才校验。校验放在 keep_or 之前：留空的输入在
+     * 这里放过，交给 keep_or 用原值兜底。 */
+    if (prompt_chinese("职称(如 主治医师)：", title, sizeof(title), 1) != 0 ||
+        prompt_chinese("科室(如 内科)：",     dept,  sizeof(dept),  1) != 0 ||
+        prompt_digits ("联系电话：",          phone, sizeof(phone), 1) != 0) {
+        printf("输入结束，已取消修改。\n");
+        return;
+    }
 
     keep_or(d.title, title, sizeof(title));
     keep_or(d.dept,  dept,  sizeof(dept));
@@ -580,8 +643,13 @@ static void do_doctor_menu(DB_HANDLE* db) {
         fflush(stdout);
 
         r = read_choice(&choice);
-        if (r == -2) return;
-        if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
+        if (r == -2) return;                 /* 输入结束，直接返回，避免空转 */
+        /* 本菜单只有 0-5，别的数字一律当成输入有误，不进 switch：
+         * read_choice 只保证"是个数字"，范围得在这里卡 */
+        if (r != 0 || choice < 0 || choice > 5) {
+            printf("输入有误，请输入 0-5 之间的序号\n");
+            continue;
+        }
 
         switch (choice) {
             case 1: doctor_list(db);        break;
@@ -590,7 +658,9 @@ static void do_doctor_menu(DB_HANDLE* db) {
             case 4: doctor_update_flow(db); break;
             case 5: doctor_delete_flow(db); break;
             case 0: running = 0;            break;
-            default: printf("无效选项\n");  break;
+            /* 上面已经把 0-5 之外的全挡掉了，这里是改菜单时忘了同步
+             * 那句 if 的兜底，免得选项编号对不上却一声不响 */
+            default: printf("输入有误，请输入 0-5 之间的序号\n"); break;
         }
     }
 }
