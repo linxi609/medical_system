@@ -23,6 +23,41 @@ int is_all_digit(const char *s) {
     return 1;
 }
 
+int is_all_chinese(const char *s) {
+    int i = 0;
+
+    if (s == NULL || s[0] == '\0') return 0;
+
+    while (s[i] != '\0') {
+        unsigned char c = (unsigned char)s[i];
+        unsigned int  cp;
+        int           len;
+        int           j;
+
+        if (c < 0x80) return 0;
+        if      ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+        else return 0;
+
+        for (j = 1; j < len; j++) {
+            unsigned char t = (unsigned char)s[i + j];
+            if (t == '\0')            return 0;
+            if ((t & 0xC0) != 0x80)   return 0;
+            cp = (cp << 6) | (t & 0x3F);
+        }
+
+        if (!((cp >= 0x4E00 && cp <= 0x9FFF) ||
+              (cp >= 0x3400 && cp <= 0x4DBF) ||
+              (cp >= 0xF900 && cp <= 0xFAFF) ||
+              (cp >= 0x20000 && cp <= 0x3FFFD))) {
+            return 0;
+        }
+
+        i += len;
+    }
+    return 1;
+}
+
 void copy_str(char* dst, size_t dstsz, const char* src) {
     if (!dst || dstsz == 0) return;
     if (!src) { dst[0] = '\0'; return; }

@@ -5,6 +5,7 @@
 
 void str_trim(char *s);
 int  is_all_digit(const char *s);
+int  is_all_chinese(const char *s);
 void copy_str(char* dst, size_t dstsz, const char* src);
 
 

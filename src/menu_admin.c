@@ -335,12 +335,15 @@ static void doctor_add_flow(DB_HANDLE* db) {
     d.status = 1;
 
     printf("\n=== 新增医生 ===\n");
-    cli_prompt("姓名：",           d.name,     sizeof(d.name));
-    cli_prompt("性别(男/女)：",    d.gender,   sizeof(d.gender));
-    cli_prompt("职称(如 主治医师)：", d.title, sizeof(d.title));
-    cli_prompt("科室(如 内科)：",  d.dept,     sizeof(d.dept));
-    cli_prompt("联系电话：",       d.phone,    sizeof(d.phone));
-    cli_prompt("登录密码：",       d.password, sizeof(d.password));
+    cli_prompt("姓名：", d.name, sizeof(d.name));
+    if (cli_prompt_chinese("性别(男/女)：",       d.gender, sizeof(d.gender), 0) != 0 ||
+        cli_prompt_chinese("职称(如 主治医师)：", d.title,  sizeof(d.title),  1) != 0 ||
+        cli_prompt_chinese("科室(如 内科)：",     d.dept,   sizeof(d.dept),   1) != 0 ||
+        cli_prompt_digits ("联系电话：",          d.phone,  sizeof(d.phone),  1) != 0) {
+        printf("输入结束，已取消新增。\n");
+        return;
+    }
+    cli_prompt("登录密码：", d.password, sizeof(d.password));
 
     ret = doctor_add(db, &d);
     if (ret == 0) {
@@ -383,9 +386,12 @@ static void doctor_update_flow(DB_HANDLE* db) {
     snprintf(dept,  sizeof(dept),  "%s", d.dept);
     snprintf(phone, sizeof(phone), "%s", d.phone);
 
-    cli_prompt("职称(如 主治医师)：", title, sizeof(title));
-    cli_prompt("科室(如 内科)：",     dept,  sizeof(dept));
-    cli_prompt("联系电话：",          phone, sizeof(phone));
+    if (cli_prompt_chinese("职称(如 主治医师)：", title, sizeof(title), 1) != 0 ||
+        cli_prompt_chinese("科室(如 内科)：",     dept,  sizeof(dept),  1) != 0 ||
+        cli_prompt_digits ("联系电话：",          phone, sizeof(phone), 1) != 0) {
+        printf("输入结束，已取消修改。\n");
+        return;
+    }
 
     cli_keep_or(d.title, title, sizeof(title));
     cli_keep_or(d.dept,  dept,  sizeof(dept));
@@ -448,7 +454,10 @@ static void do_doctor_menu(DB_HANDLE* db) {
 
         r = cli_read_choice(&choice);
         if (r == -2) return;
-        if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
+        if (r != 0 || choice < 0 || choice > 5) {
+            printf("输入有误，请输入 0-5 之间的序号\n");
+            continue;
+        }
 
         switch (choice) {
             case 1: doctor_list(db);        break;
@@ -457,7 +466,7 @@ static void do_doctor_menu(DB_HANDLE* db) {
             case 4: doctor_update_flow(db); break;
             case 5: doctor_delete_flow(db); break;
             case 0: running = 0;            break;
-            default: printf("无效选项\n");  break;
+            default: printf("输入有误，请输入 0-5 之间的序号\n"); break;
         }
     }
 }

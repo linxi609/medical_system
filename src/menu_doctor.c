@@ -720,7 +720,10 @@ void menu_doctor(DB_HANDLE* db, const LoginUser* user) {
 
         r = cli_read_choice(&choice);
         if (r == -2) return;
-        if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
+        if (r != 0 || choice < 0 || choice > 6) {
+            printf("输入有误，请输入 0-6 之间的序号\n");
+            continue;
+        }
 
         switch (choice) {
             case 1: do_visit(db, user);           break;
@@ -730,7 +733,7 @@ void menu_doctor(DB_HANDLE* db, const LoginUser* user) {
             case 5: do_medicine_list(db);         break;
             case 6: menu_change_password(db, user); break;
             case 0: running = 0;                  break;
-            default: printf("无效选项\n");        break;
+            default: printf("输入有误，请输入 0-6 之间的序号\n"); break;
         }
     }
 

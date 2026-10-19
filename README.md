@@ -178,7 +178,7 @@ make clean    # 清理
 
 **通用工具** `inc/utils.h` / `lib/utils.c`
 
-- `str_trim` / `is_all_digit` / `copy_str`
+- `str_trim` / `is_all_digit` / `is_all_chinese` / `copy_str`
 - `utf8_width` / `utf8_valid`: UTF-8 显示宽度与合法性检查
 - `table_row`: 按显示宽度输出表格行
 
@@ -186,6 +186,7 @@ make clean    # 清理
 
 - `cli_read_line`: 读取完整一行，丢弃缓冲区外的剩余字符
 - `cli_prompt` / `cli_prompt_int` / `cli_prompt_double`: 带提示的输入
+- `cli_prompt_chinese` / `cli_prompt_digits`: 只允许汉字或只允许数字的输入，可设置是否允许留空
 - `cli_read_choice`: 读取菜单选项
 - `cli_keep_or`: 直接回车时保留原值
 
