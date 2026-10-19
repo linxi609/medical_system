@@ -1,86 +1,29 @@
-/* ==========================================================================
- * medical_record.h —— M07 电子病历
- * --------------------------------------------------------------------------
- * 负责组：医生组
- * 对应表：t_medical_record
- * 功能：医生为患者书写病历，记录过敏史、既往史、家族史；患者查询本人历次病历。
- *
- * 【业务规则】一个患者可有多条病历，每次就诊对应一条。
- *   过敏史为必填项——确实没有过敏就填空字符串，表示"无过敏"。
- *   医生只能修改本人书写、且在 24 小时以内的病历，超时后锁定不能改。
- *
- * 【返回值约定】本模块函数使用以下返回值，各函数只会用到其中一部分：
- *    0   成功
- *   -1   数据库连接失败
- *   -2   SQL 执行失败
- *   -4   病历或就诊记录不存在
- *   -6   越权操作（不是本人书写的病历）
- *   -7   病历已锁定（超过 24 小时不能修改）
- * ========================================================================== */
 
 #ifndef MEDICAL_RECORD_H
 #define MEDICAL_RECORD_H
 
 #include "db_mysql.h"
 
-/* 病历，对应表 t_medical_record 的一行 */
 typedef struct {
-    int  record_id;                 /* 病历 ID，自增主键 */
-    char patient_id[20];            /* 患者编号 */
-    char doctor_id[10];             /* 书写医生编号 */
-    int  visit_id;                  /* 对应的就诊 ID，每次就诊一条病历 */
-    char allergy_history[200];      /* 过敏史，必填，没有就填空字符串 */
-    char past_history[200];         /* 既往史 */
-    char family_history[200];       /* 家族史 */
-    char update_time[20];           /* 最后更新时间 */
+    int  record_id;
+    char patient_id[20];
+    char doctor_id[10];
+    int  visit_id;
+    char allergy_history[200];
+    char past_history[200];
+    char family_history[200];
+    char update_time[20];
 } MedicalRecord;
 
-/* --------------------------------------------------------------------------
- * 新增病历
- * 参数：db  已连接的数据库句柄
- *       r   [入参+出参] 病历信息。除 record_id 外各字段由调用者填好，
- *           其中 visit_id 必须填；成功后 record_id 回写到 r->record_id
- * 返回：0 成功；-4 就诊记录不存在；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int medical_record_add(DB_HANDLE* db, MedicalRecord* r);
 
-/* --------------------------------------------------------------------------
- * 修改病历
- * 参数：db  已连接的数据库句柄
- *       r   病历信息，按 record_id 定位，其余字段为改后的值
- * 说明：只能改本人书写的；且从 update_time 算起不超过 24 小时，
- *       超过则返回锁定，让调用方提示"病历已锁定"
- * 返回：0 成功；-4 病历不存在；-6 不是本人书写的；-7 已超过 24 小时锁定；
- *       -2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int medical_record_update(DB_HANDLE* db, const MedicalRecord* r);
 
-/* --------------------------------------------------------------------------
- * 查询某患者的全部病历
- * 参数：db         已连接的数据库句柄
- *       patient_id 患者编号
- *       out_list   [出参] 函数内部 malloc 出数组，
- *                  用完必须调 medical_record_list_free
- *       out_count  [出参] 结果条数
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int medical_record_query_by_patient(DB_HANDLE* db, const char* patient_id,
                                     MedicalRecord** out_list, int* out_count);
 
-/* --------------------------------------------------------------------------
- * 查询全部病历（管理员用，对应管理员主菜单"病历查询"）
- * 参数：db         已连接的数据库句柄
- *       out_list   [出参] 函数内部 malloc 出数组，
- *                  用完必须调 medical_record_list_free
- *       out_count  [出参] 结果条数
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int medical_record_query_all(DB_HANDLE* db, MedicalRecord** out_list, int* out_count);
 
-/* --------------------------------------------------------------------------
- * 释放 medical_record_query_by_patient 返回的数组
- * 参数：list  medical_record_query_by_patient 得到的数组，传 NULL 也安全
- * -------------------------------------------------------------------------- */
 void medical_record_list_free(MedicalRecord* list);
 
-#endif /* MEDICAL_RECORD_H */
+#endif

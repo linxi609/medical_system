@@ -1,26 +1,3 @@
-/* ==========================================================================
- * menu_patient.c —— 患者工作台 实现
- * --------------------------------------------------------------------------
- * 负责组：患者组
- * 对应头文件：inc/menu.h（菜单项清单和各自该调哪个函数，见 menu_patient 的注释）
- * 对应界面原型：教程 1.7 "患者工作台"
- *
- * 菜单项：
- *   1. 挂号          -> doctor_query_all 选医生，appointment_add 挂号
- *   2. 我的预约      -> appointment_query_by_patient / appointment_cancel
- *   3. 我的就诊记录  -> visit_query_by_patient
- *   4. 我的处方      -> prescription_query_by_patient / prescription_query_by_id
- *   5. 我的病历      -> medical_record_query_by_patient
- *   6. 修改个人资料  -> patient_update_self / user_change_password
- *   0. 返回登录
- *
- * 说明：
- *   - 输入一律按 main.c 里 read_line 的写法读整行，不用 scanf("%d")，
- *     避免 scanf 遇到字母卡住、以及残留字符窜到下一次输入里。
- *   - 挂号日期格式 YYYY-MM-DD，只允许挂今天和以后的号；
- *     时段固定 "上午" / "下午" 两档。
- *   - 所有失败分支按各模块注释里约定的返回码给出中文提示。
- * ========================================================================== */
 
 #include "menu.h"
 #include "doctor.h"
@@ -30,96 +7,29 @@
 #include "prescription.h"
 #include "medical_record.h"
 #include "utils.h"
+#include "menu_common.h"
+#include "cli_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-/* ==========================================================================
- * 输入辅助（写法参照 src/main.c 里的 read_line / prompt）
- * ========================================================================== */
 
-/* 读一整行，去掉末尾换行。返回 0 成功，-1 读失败/输入结束
- *
- * 注意 else 分支不能省：fgets 最多只读 size-1 字节，若这一行比缓冲区还长，
- * 它会刚好填满缓冲区、连换行都没读到就返回，剩下的字符会被下一次读取
- * 当成新的一行，把后面每个字段都顶错一位且不报错。 */
-static int read_line(char* buf, int size) {
-    if (!fgets(buf, size, stdin)) return -1;
 
-    size_t len = strlen(buf);
-    if (len > 0 && buf[len - 1] == '\n') {
-        buf[len - 1] = '\0';                /* 正常情况：读到换行，去掉它 */
-    } else {
-        int c;                              /* 缓冲区装满了，丢掉本行剩下的字符 */
-        while ((c = getchar()) != '\n' && c != EOF) { /* 空循环 */ }
-    }
-    return 0;
-}
 
-/* 显示提示语后读一整行字符串。
- * 读到不是合法 UTF-8 的字节就重问：这种输入原样发给 MySQL 会被拒
- * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。 */
-static void prompt(const char* label, char* buf, int size) {
-    for (;;) {
-        printf("%s", label);
-        fflush(stdout);
-        if (read_line(buf, size) != 0) { buf[0] = '\0'; return; }
-        if (utf8_valid(buf)) return;
-        printf("输入里含有非 UTF-8 的字节，MySQL 会拒绝这样的内容。常见原因有两个：\n"
-               "  1) 当前终端/粘贴内容的编码不是 UTF-8 —— 确认 locale 里带 UTF-8；\n"
-               "  2) 这一行太长，被输入缓冲区截断，末尾正好切在汉字中间 —— 请分短一些。\n"
-               "请修改后重新输入：\n");
-    }
-}
 
-/* 显示提示语后读一个整数 */
-static void prompt_int(const char* label, int* out) {
-    char buf[32];
-    prompt(label, buf, sizeof(buf));
-    *out = atoi(buf);
-}
 
-/* 读一个菜单选项。返回 0 成功，-1 输入非法，-2 输入结束（Ctrl+D 或管道读完） */
-static int read_choice(int* out) {
-    char buf[32];
-    if (read_line(buf, sizeof(buf)) != 0) return -2;
-    if (sscanf(buf, "%d", out) != 1) return -1;
-    return 0;
-}
 
-/* 返回码 -> 中文原因，供各失败分支打印 */
-static const char* err_text(int ret) {
-    switch (ret) {
-        case -1: return "数据库连接失败";
-        case -2: return "SQL 执行失败";
-        case -3: return "唯一字段重复";
-        case -4: return "记录不存在";
-        case -5: return "库存不足";
-        case -6: return "越权操作或状态不允许";
-        case -7: return "账号或病历已锁定";
-        case -8: return "重复挂号";
-        default: return "未知错误";
-    }
-}
 
-/* 预约状态：0 待就诊，1 已就诊，2 已取消 */
-static const char* appoint_status_text(int status) {
-    switch (status) {
-        case 0:  return "待就诊";
-        case 1:  return "已就诊";
-        case 2:  return "已取消";
-        default: return "未知";
-    }
-}
 
-/* 处方状态：1 有效 / 0 已作废 */
-static const char* presc_status_text(int status) {
-    return status == 1 ? "有效" : "已作废";
-}
 
-/* 校验日期格式 YYYY-MM-DD，且不能早于今天。1 合法，0 不合法 */
+
+
+
+
+
+
 static int date_ok(const char* s) {
     int y, m, d;
     char today[12];
@@ -129,7 +39,6 @@ static int date_ok(const char* s) {
     if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3) return 0;
     if (y < 2000 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return 0;
 
-    /* 和当天比：字符串形式的 YYYY-MM-DD 可直接按字典序比较 */
     {
         time_t now = time(NULL);
         struct tm* tm_now = localtime(&now);
@@ -140,9 +49,6 @@ static int date_ok(const char* s) {
     return strcmp(s, today) >= 0;
 }
 
-/* ==========================================================================
- * 1. 挂号
- * ========================================================================== */
 static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
     Doctor* doctors = NULL;
     int     count = 0;
@@ -151,7 +57,6 @@ static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
     int     pick;
     Appointment a;
 
-    /* ---------- 列出在职医生供选择 ---------- */
     ret = doctor_query_all(db, &doctors, &count);
     if (ret != 0) {
         printf("[查询医生列表失败：%s]\n", err_text(ret));
@@ -185,7 +90,7 @@ static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
         }
     }
 
-    prompt_int("请选择医生序号（0 取消）：", &pick);
+    cli_prompt_int("请选择医生序号（0 取消）：", &pick);
     if (pick <= 0) {
         printf("已取消挂号。\n");
         doctor_list_free(doctors);
@@ -202,8 +107,7 @@ static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
     snprintf(a.doctor_id,  sizeof(a.doctor_id),  "%s", doctors[pick - 1].doctor_id);
     doctor_list_free(doctors);
 
-    /* ---------- 日期与时段 ---------- */
-    prompt("预约日期（格式 YYYY-MM-DD，只能挂今天及以后）：",
+    cli_prompt("预约日期（格式 YYYY-MM-DD，只能挂今天及以后）：",
            a.appoint_date, sizeof(a.appoint_date));
     if (!date_ok(a.appoint_date)) {
         printf("日期格式不正确或早于今天，已取消挂号。\n");
@@ -211,7 +115,7 @@ static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
     }
 
     printf("时段：1. 上午   2. 下午\n");
-    prompt_int("请选择时段[1-2]：", &pick);
+    cli_prompt_int("请选择时段[1-2]：", &pick);
     if (pick == 1)      snprintf(a.time_slot, sizeof(a.time_slot), "上午");
     else if (pick == 2) snprintf(a.time_slot, sizeof(a.time_slot), "下午");
     else {
@@ -219,9 +123,8 @@ static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
         return;
     }
 
-    prompt("症状描述：", a.symptom, sizeof(a.symptom));
+    cli_prompt("症状描述：", a.symptom, sizeof(a.symptom));
 
-    /* ---------- 提交 ---------- */
     ret = appointment_add(db, &a);
     if (ret == 0) {
         printf("\n挂号成功！预约编号 %d，%s %s，医生 %s\n",
@@ -235,9 +138,6 @@ static void do_appoint(DB_HANDLE* db, const LoginUser* user) {
     }
 }
 
-/* ==========================================================================
- * 2. 我的预约（可取消待就诊的）
- * ========================================================================== */
 static void do_my_appointments(DB_HANDLE* db, const LoginUser* user) {
     Appointment* list = NULL;
     int count = 0;
@@ -272,18 +172,17 @@ static void do_my_appointments(DB_HANDLE* db, const LoginUser* user) {
             cells[1] = list[i].doctor_id;
             cells[2] = list[i].appoint_date;
             cells[3] = list[i].time_slot;
-            cells[4] = appoint_status_text(list[i].status);
+            cells[4] = appt_status_text(list[i].status);
             cells[5] = list[i].symptom[0] ? list[i].symptom : "（未填）";
             table_row(cells, w, 6);
         }
     }
 
-    /* 循环处理取消，免得每取消一条都要重进一次菜单 */
     for (;;) {
         int appoint_id = 0;
         char ans[16];
 
-        prompt_int("\n输入要取消的预约ID（0 结束）：", &appoint_id);
+        cli_prompt_int("\n输入要取消的预约ID（0 结束）：", &appoint_id);
         if (appoint_id <= 0) break;
 
         for (i = 0; i < count; i++) {
@@ -294,11 +193,11 @@ static void do_my_appointments(DB_HANDLE* db, const LoginUser* user) {
             continue;
         }
         if (list[i].status != 0) {
-            printf("该预约已是\"%s\"，不能取消。\n", appoint_status_text(list[i].status));
+            printf("该预约已是\"%s\"，不能取消。\n", appt_status_text(list[i].status));
             continue;
         }
 
-        prompt("确认取消这条预约？(y/N)：", ans, sizeof(ans));
+        cli_prompt("确认取消这条预约？(y/N)：", ans, sizeof(ans));
         if (ans[0] != 'y' && ans[0] != 'Y') {
             printf("已取消操作。\n");
             continue;
@@ -307,7 +206,7 @@ static void do_my_appointments(DB_HANDLE* db, const LoginUser* user) {
         ret = appointment_cancel(db, appoint_id, user->id);
         if (ret == 0) {
             printf("预约 %d 已取消。\n", appoint_id);
-            list[i].status = 2;             /* 本地列表同步状态，避免重复取消 */
+            list[i].status = 2;
         } else if (ret == -6) {
             printf("取消失败：该预约已被医生接诊或已被取消\n");
         } else {
@@ -318,9 +217,6 @@ static void do_my_appointments(DB_HANDLE* db, const LoginUser* user) {
     appointment_list_free(list);
 }
 
-/* ==========================================================================
- * 3. 我的就诊记录
- * ========================================================================== */
 static void do_my_visits(DB_HANDLE* db, const LoginUser* user) {
     VisitRecord* list = NULL;
     int count = 0;
@@ -356,9 +252,6 @@ static void do_my_visits(DB_HANDLE* db, const LoginUser* user) {
     visit_list_free(list);
 }
 
-/* ==========================================================================
- * 4. 我的处方（可看明细）
- * ========================================================================== */
 static void do_my_prescriptions(DB_HANDLE* db, const LoginUser* user) {
     Prescription* list = NULL;
     int count = 0;
@@ -401,11 +294,10 @@ static void do_my_prescriptions(DB_HANDLE* db, const LoginUser* user) {
         }
     }
 
-    /* 输入处方ID看明细 */
     for (;;) {
         int presc_id = 0;
 
-        prompt_int("\n输入处方ID查看明细（0 结束）：", &presc_id);
+        cli_prompt_int("\n输入处方ID查看明细（0 结束）：", &presc_id);
         if (presc_id <= 0) break;
 
         for (i = 0; i < count; i++) {
@@ -416,7 +308,6 @@ static void do_my_prescriptions(DB_HANDLE* db, const LoginUser* user) {
             continue;
         }
 
-        /* 查出来的这张处方就是列表里本人的，直接用 ID 拉明细 */
         {
             Prescription p;
             PrescDetail* items = NULL;
@@ -471,9 +362,6 @@ static void do_my_prescriptions(DB_HANDLE* db, const LoginUser* user) {
     prescription_list_free(list);
 }
 
-/* ==========================================================================
- * 5. 我的病历
- * ========================================================================== */
 static void do_my_records(DB_HANDLE* db, const LoginUser* user) {
     MedicalRecord* list = NULL;
     int count = 0;
@@ -507,16 +395,10 @@ static void do_my_records(DB_HANDLE* db, const LoginUser* user) {
     medical_record_list_free(list);
 }
 
-/* ==========================================================================
- * 6. 修改个人资料 / 密码
- * ========================================================================== */
 static void do_profile(DB_HANDLE* db, const LoginUser* user) {
     Patient p;
     char    phone[sizeof(p.phone)];
     char    address[sizeof(p.address)];
-    char    old_pwd[64];
-    char    new_pwd[64];
-    char    confirm[64];
     int     ret;
 
     printf("\n--- 修改个人资料 ---\n");
@@ -527,13 +409,12 @@ static void do_profile(DB_HANDLE* db, const LoginUser* user) {
 
     {
         int choice = 0;
-        int r = read_choice(&choice);
+        int r = cli_read_choice(&choice);
         if (r != 0) { printf("输入无效，已返回。\n"); return; }
 
         if (choice == 0) return;
 
         if (choice == 1) {
-            /* 先查出当前资料，直接回车保留原值 */
             ret = patient_query_by_id(db, user->id, &p);
             if (ret != 0) {
                 printf("[读取个人资料失败：%s]\n", err_text(ret));
@@ -543,8 +424,8 @@ static void do_profile(DB_HANDLE* db, const LoginUser* user) {
             printf("当前住址：%s\n", p.address[0] ? p.address : "（未填）");
             printf("直接回车即保留原值。\n");
 
-            prompt("新电话：", phone, sizeof(phone));
-            prompt("新住址：", address, sizeof(address));
+            cli_prompt("新电话：", phone, sizeof(phone));
+            cli_prompt("新住址：", address, sizeof(address));
             if (phone[0] == '\0')   snprintf(phone,   sizeof(phone),   "%s", p.phone);
             if (address[0] == '\0') snprintf(address, sizeof(address), "%s", p.address);
 
@@ -558,31 +439,7 @@ static void do_profile(DB_HANDLE* db, const LoginUser* user) {
         }
 
         if (choice == 2) {
-            prompt("原密码：",     old_pwd, sizeof(old_pwd));
-            prompt("新密码：",     new_pwd, sizeof(new_pwd));
-            prompt("确认新密码：", confirm, sizeof(confirm));
-
-            if (new_pwd[0] == '\0') {
-                printf("新密码不能为空，已取消。\n");
-                return;
-            }
-            if (strcmp(new_pwd, confirm) != 0) {
-                printf("两次输入的新密码不一致，已取消。\n");
-                return;
-            }
-            if (strcmp(old_pwd, new_pwd) == 0) {
-                printf("新密码和原密码相同，已取消。\n");
-                return;
-            }
-
-            ret = user_change_password(db, user->role, user->id, old_pwd, new_pwd);
-            if (ret == 0) {
-                printf("密码修改成功，下次登录请用新密码。\n");
-            } else if (ret == -4) {
-                printf("修改失败：原密码错误\n");
-            } else {
-                printf("修改失败：%s\n", err_text(ret));
-            }
+            menu_change_password(db, user);
             return;
         }
 
@@ -590,13 +447,9 @@ static void do_profile(DB_HANDLE* db, const LoginUser* user) {
     }
 }
 
-/* ==========================================================================
- * 患者工作台主循环
- * ========================================================================== */
 void menu_patient(DB_HANDLE* db, const LoginUser* user) {
     int running = 1;
 
-    /* 角色 3 = 患者，越权直接拒绝 */
     if (!db || !user || user->role != 3) return;
 
     printf("\n========================================\n");
@@ -619,8 +472,8 @@ void menu_patient(DB_HANDLE* db, const LoginUser* user) {
         printf("请输入选项[0-6]：");
         fflush(stdout);
 
-        r = read_choice(&choice);
-        if (r == -2) return;                     /* 输入结束，直接返回，避免空转 */
+        r = cli_read_choice(&choice);
+        if (r == -2) return;
         if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
 
         switch (choice) {

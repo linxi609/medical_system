@@ -1,91 +1,32 @@
-/* ==========================================================================
- * visit.h —— M04 接诊与就诊记录
- * --------------------------------------------------------------------------
- * 负责组：医生组
- * 对应表：t_visit_record（本模块）、t_appointment（接诊时更新状态）
- * 功能：医生从当日待就诊列表中接诊患者，录入主诉、现病史、体温、血压、心率，
- *       生成就诊记录；患者可查询本人全部就诊记录。
- *
- * 【事务要求】visit_add 必须把"写入 t_visit_record"和"把对应预约的 status
- * 置为 1"放在同一个事务里（BEGIN ... COMMIT），任何一步失败都要 ROLLBACK。
- * 否则会出现"有就诊记录但预约还挂在待就诊"或者反过来的一半状态。
- *
- * 【返回值约定】本模块函数使用以下返回值，各函数只会用到其中一部分：
- *    0   成功
- *   -1   数据库连接失败
- *   -2   SQL 执行失败（已回滚）
- *   -4   预约不存在
- *   -6   越权操作（该预约不属于当前医生 / 预约状态不是待就诊）
- * ========================================================================== */
 
 #ifndef VISIT_H
 #define VISIT_H
 
 #include "db_mysql.h"
 
-/* 就诊记录，对应表 t_visit_record 的一行 */
 typedef struct {
-    int  visit_id;              /* 就诊 ID，自增主键 */
-    char patient_id[20];        /* 患者编号 */
-    char doctor_id[10];         /* 医生编号 */
-    int  appoint_id;            /* 对应的预约 ID */
-    char visit_time[20];        /* 就诊时间，格式 "YYYY-MM-DD HH:MM:SS" */
-    char chief_complaint[500];  /* 主诉，如 "咳嗽 3 天" */
-    char present_illness[500];  /* 现病史 */
-    double temp;                /* 体温，如 36.5 */
-    char blood_pressure[10];    /* 血压，如 "120/80" */
-    int  heart_rate;            /* 心率，次/分 */
+    int  visit_id;
+    char patient_id[20];
+    char doctor_id[10];
+    int  appoint_id;
+    char visit_time[20];
+    char chief_complaint[500];
+    char present_illness[500];
+    double temp;
+    char blood_pressure[10];
+    int  heart_rate;
 } VisitRecord;
 
-/* --------------------------------------------------------------------------
- * 接诊：写入就诊记录，并把对应预约状态置为已就诊
- * 参数：db  已连接的数据库句柄
- *       v   [入参+出参] 就诊信息。除 visit_id 外各字段由调用者填好，
- *           其中 appoint_id 必须填；成功后 visit_id 回写到 v->visit_id
- * 说明：
- *       1) 只允许对 status 为 0（待就诊）的预约接诊
- *       2) 写 t_visit_record 和更新 t_appointment.status=1 必须同一事务
- *       3) 重复接诊同一条预约要拒绝，靠状态判断拦住
- * 返回：0 成功；-4 预约不存在；-6 预约不属于该医生或已被接诊/取消；
- *       -2 SQL 执行失败（已回滚）
- * -------------------------------------------------------------------------- */
 int visit_add(DB_HANDLE* db, VisitRecord* v);
 
-/* --------------------------------------------------------------------------
- * 查询某患者的全部就诊记录
- * 参数：db         已连接的数据库句柄
- *       patient_id 患者编号
- *       out_list   [出参] 函数内部 malloc 出数组，用完必须调 visit_list_free
- *       out_count  [出参] 结果条数
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int visit_query_by_patient(DB_HANDLE* db, const char* patient_id,
                            VisitRecord** out_list, int* out_count);
 
-/* --------------------------------------------------------------------------
- * 查询某医生经手的全部就诊记录
- * 参数：db         已连接的数据库句柄
- *       doctor_id  医生编号
- *       out_list   [出参] 函数内部 malloc 出数组，用完必须调 visit_list_free
- *       out_count  [出参] 结果条数
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int visit_query_by_doctor(DB_HANDLE* db, const char* doctor_id,
                           VisitRecord** out_list, int* out_count);
 
-/* --------------------------------------------------------------------------
- * 查询全部就诊记录（管理员用，对应管理员主菜单"就诊记录查询"）
- * 参数：db         已连接的数据库句柄
- *       out_list   [出参] 函数内部 malloc 出数组，用完必须调 visit_list_free
- *       out_count  [出参] 结果条数
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int visit_query_all(DB_HANDLE* db, VisitRecord** out_list, int* out_count);
 
-/* --------------------------------------------------------------------------
- * 释放 visit_query_* 返回的数组
- * 参数：list  visit_query_* 得到的数组，传 NULL 也安全
- * -------------------------------------------------------------------------- */
 void visit_list_free(VisitRecord* list);
 
-#endif /* VISIT_H */
+#endif

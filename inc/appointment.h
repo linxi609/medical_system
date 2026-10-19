@@ -1,99 +1,24 @@
-/* ==========================================================================
- * appointment.h —— M03 挂号预约
- * --------------------------------------------------------------------------
- * 负责组：患者组（挂号、取消）、医生组（查看当日待就诊、接诊）
- * 对应表：t_appointment
- * 功能：患者选择医生、日期、时段挂号；患者查看本人预约并取消未就诊的预约；
- *       医生查看当日待就诊列表并接诊；管理员查看全部预约。
- *
- * 【status 状态流转】数据库里存的是数字，含义如下：
- *    0 = 待就诊   患者挂号后的初始状态
- *    1 = 已就诊   医生接诊后（由 visit_add 在事务中置为 1）
- *    2 = 已取消   患者或管理员取消
- * 只有状态 0 的预约可以取消或接诊。
- *
- * 【返回值约定】本模块函数使用以下返回值，各函数只会用到其中一部分：
- *    0   成功
- *   -1   数据库连接失败
- *   -2   SQL 执行失败
- *   -4   预约不存在
- *   -6   越权操作（别人的预约 / 状态不是待就诊，不允许取消或接诊）
- *   -8   重复挂号（同一患者、同一天、同一医生已有预约）
- * ========================================================================== */
 
 #ifndef APPOINTMENT_H
 #define APPOINTMENT_H
 
 #include "db_mysql.h"
 
-/* 预约信息，对应表 t_appointment 的一行 */
 typedef struct {
-    int  appoint_id;        /* 预约 ID，自增主键 */
-    char patient_id[20];    /* 患者编号 */
-    char doctor_id[10];     /* 医生编号 */
-    char appoint_date[12];  /* 预约日期，格式 "YYYY-MM-DD" */
-    char time_slot[10];     /* 时段，如 "上午" / "下午" */
-    char symptom[200];      /* 症状描述 */
-    int  status;            /* 状态：0 待就诊，1 已就诊，2 已取消 */
-    char create_time[20];   /* 挂号时间 */
+    int  appoint_id;
+    char patient_id[20];
+    char doctor_id[10];
+    char appoint_date[12];
+    char time_slot[10];
+    char symptom[200];
+    int  status;
+    char create_time[20];
 } Appointment;
-
-/* --------------------------------------------------------------------------
- * 患者挂号
- * 参数：db  已连接的数据库句柄
- *       a   [入参+出参] 预约信息。除 appoint_id 外各字段由调用者填好，
- *           status 固定填 0；成功后 appoint_id 回写到 a->appoint_id
- * 说明：同一患者同一天同一医生不能重复挂号；取消之后可以重新挂号
- * 返回：0 成功；-8 重复挂号；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int appointment_add(DB_HANDLE* db, Appointment* a);
-
-/* --------------------------------------------------------------------------
- * 取消预约
- * 参数：db          已连接的数据库句柄
- *       appoint_id  预约 ID
- *       patient_id  发起取消的患者编号，用于校验这条预约是不是他本人的
- * 说明：把 status 由 0 改为 2。已就诊（1）或已取消（2）的预约不能取消
- * 返回：0 成功；-4 预约不存在；-6 不是本人的预约或状态不允许取消；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
 int appointment_cancel(DB_HANDLE* db, int appoint_id, const char* patient_id);
-
-/* --------------------------------------------------------------------------
- * 查询某患者的全部预约
- * 参数：db         已连接的数据库句柄
- *       patient_id 患者编号
- *       out_list   [出参] 函数内部 malloc 出数组，用完必须调 appointment_list_free
- *       out_count  [出参] 结果条数
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
-int appointment_query_by_patient(DB_HANDLE* db, const char* patient_id,
-                                 Appointment** out_list, int* out_count);
-
-/* --------------------------------------------------------------------------
- * 查询某医生当天待就诊的预约
- * 参数：db         已连接的数据库句柄
- *       doctor_id  医生编号
- *       out_list   [出参] 函数内部 malloc 出数组，用完必须调 appointment_list_free
- *       out_count  [出参] 结果条数
- * 说明：医生工作台进入时调用。只查 appoint_date 是今天、status 为 0 的记录
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
-int appointment_query_by_doctor_today(DB_HANDLE* db, const char* doctor_id,
-                                      Appointment** out_list, int* out_count);
-
-/* --------------------------------------------------------------------------
- * 查询全部预约（管理员用）
- * 参数：db         已连接的数据库句柄
- *       out_list   [出参] 函数内部 malloc 出数组，用完必须调 appointment_list_free
- *       out_count  [出参] 结果条数
- * 返回：0 成功（可能 out_count 为 0）；-2 SQL 执行失败
- * -------------------------------------------------------------------------- */
+int appointment_query_by_patient(DB_HANDLE* db, const char* patient_id, Appointment** out_list, int* out_count);
+int appointment_query_by_doctor_today(DB_HANDLE* db, const char* doctor_id,Appointment** out_list, int* out_count);
 int appointment_query_all(DB_HANDLE* db, Appointment** out_list, int* out_count);
-
-/* --------------------------------------------------------------------------
- * 释放 appointment_query_* 返回的数组
- * 参数：list  appointment_query_* 得到的数组，传 NULL 也安全
- * -------------------------------------------------------------------------- */
 void appointment_list_free(Appointment* list);
 
-#endif /* APPOINTMENT_H */
+#endif

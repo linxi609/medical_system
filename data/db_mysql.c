@@ -32,7 +32,6 @@ void db_close(DB_HANDLE* h) {
     free(h);
 }
 
-/* 增删改：普通查询方式，简单版 */
 int db_execute(DB_HANDLE* h, const char* sql) {
     if (!h || !h->is_connected || !sql) return -1;
     if (mysql_query(h->mysql, sql)) {
@@ -42,7 +41,6 @@ int db_execute(DB_HANDLE* h, const char* sql) {
     return (int)mysql_affected_rows(h->mysql);
 }
 
-/* 查询：返回结果集，用完必须 db_res_free */
 DB_RES* db_query(DB_HANDLE* h, const char* sql) {
     if (!h || !h->is_connected || !sql) return NULL;
     if (mysql_query(h->mysql, sql)) {
@@ -74,4 +72,48 @@ void db_res_free(DB_RES* res) {
     if (!res) return;
     if (res->res) mysql_free_result(res->res);
     free(res);
+}
+
+char* db_escape(DB_HANDLE* h, const char* src, char* dst, size_t dstsz) {
+    size_t n;
+    if (!h || !h->mysql || !dst || dstsz == 0) return NULL;
+    if (!src) src = "";
+    n = strlen(src);
+    if (n > (dstsz - 1) / 2) return NULL;
+    mysql_real_escape_string(h->mysql, dst, src, (unsigned long)n);
+    return dst;
+}
+
+char* db_escape_literal(DB_HANDLE* h, const char* src, char* dst, size_t dstsz) {
+    size_t n;
+    if (!dst || dstsz < 3) return NULL;
+    if (!db_escape(h, src, dst + 1, dstsz - 2)) return NULL;
+    n = strlen(dst + 1);
+    dst[0] = '\'';
+    dst[n + 1] = '\'';
+    dst[n + 2] = '\0';
+    return dst;
+}
+
+const char* db_row_str(DB_RES* res, DB_ROW* row, int idx) {
+    if (!row || !row->fields) return "";
+    if (idx < 0 || idx >= row->col_cnt || idx >= res->col_cnt) return "";
+    if (!row->fields[idx]) return "";
+    return row->fields[idx];
+}
+
+int db_row_int(DB_RES* res, DB_ROW* row, int idx) {
+    const char* s = db_row_str(res, row, idx);
+    return s[0] ? atoi(s) : 0;
+}
+
+double db_row_double(DB_RES* res, DB_ROW* row, int idx) {
+    const char* s = db_row_str(res, row, idx);
+    return s[0] ? atof(s) : 0.0;
+}
+
+int db_begin_tx(DB_HANDLE* h) {
+    if (!h || !h->is_connected) return -1;
+    if (db_execute(h, "BEGIN") < 0) return -2;
+    return 0;
 }

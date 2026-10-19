@@ -1,14 +1,8 @@
--- ============================================================
--- 社区医疗服务中心信息管理系统 —— 建库建表脚本
--- 用法: mysql -u root -p < init.sql
--- 注意: 会先 DROP 再 CREATE,重复执行会清空已有数据
--- ============================================================
 
 DROP DATABASE IF EXISTS medical_system;
 CREATE DATABASE medical_system DEFAULT CHARACTER SET utf8mb4;
 USE medical_system;
 
--- 管理员表
 CREATE TABLE t_admin (
     admin_id VARCHAR(10) PRIMARY KEY,
     name     VARCHAR(50),
@@ -17,7 +11,6 @@ CREATE TABLE t_admin (
     phone    VARCHAR(20)
 );
 
--- 医生表
 CREATE TABLE t_doctor (
     doctor_id VARCHAR(10) PRIMARY KEY,
     name      VARCHAR(50) NOT NULL,
@@ -30,7 +23,6 @@ CREATE TABLE t_doctor (
     status    TINYINT DEFAULT 1
 );
 
--- 患者表
 CREATE TABLE t_patient (
     patient_id  VARCHAR(20) PRIMARY KEY,
     name        VARCHAR(50) NOT NULL,
@@ -45,7 +37,6 @@ CREATE TABLE t_patient (
     status      TINYINT DEFAULT 1
 );
 
--- 药品表
 CREATE TABLE t_medicine (
     med_id       VARCHAR(20) PRIMARY KEY,
     med_name     VARCHAR(50),
@@ -56,7 +47,6 @@ CREATE TABLE t_medicine (
     manufacturer VARCHAR(50)
 );
 
--- 预约表
 CREATE TABLE t_appointment (
     appoint_id   INT PRIMARY KEY AUTO_INCREMENT,
     patient_id   VARCHAR(20) NOT NULL,
@@ -70,7 +60,6 @@ CREATE TABLE t_appointment (
     INDEX idx_doctor_date (doctor_id, appoint_date, status)
 );
 
--- 就诊记录表
 CREATE TABLE t_visit_record (
     visit_id        INT PRIMARY KEY AUTO_INCREMENT,
     patient_id      VARCHAR(20),
@@ -84,7 +73,6 @@ CREATE TABLE t_visit_record (
     heart_rate      INT
 );
 
--- 处方主表
 CREATE TABLE t_prescription (
     presc_id    INT PRIMARY KEY AUTO_INCREMENT,
     visit_id    INT,
@@ -95,7 +83,6 @@ CREATE TABLE t_prescription (
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 处方明细表
 CREATE TABLE t_presc_detail (
     detail_id  INT PRIMARY KEY AUTO_INCREMENT,
     presc_id   INT,
@@ -106,7 +93,6 @@ CREATE TABLE t_presc_detail (
     subtotal   DECIMAL(10,2)
 );
 
--- 病历表
 CREATE TABLE t_medical_record (
     record_id       INT PRIMARY KEY AUTO_INCREMENT,
     patient_id      VARCHAR(20),
@@ -118,10 +104,6 @@ CREATE TABLE t_medical_record (
     update_time     DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 预置账号
--- 登录账号规则：医生、患者的账号由系统生成，就等于各自的编号
--- （医生 D001 / 患者注册后拿到的 P2026xxxx），不用自己起名、也不复用；
--- 管理员只有预置的 admin 一个。
 INSERT INTO t_admin VALUES ('A001', '系统管理员', 'admin', '123456', '');
 INSERT INTO t_doctor VALUES ('D001', '张医生', '男', '主治医师', '内科', '', 'D001', '123456', 1);
 INSERT INTO t_medicine VALUES ('M001', '阿莫西林', '0.25g*24粒', '盒', 15.50, 100, '某药厂');

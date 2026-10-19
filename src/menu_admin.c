@@ -1,32 +1,3 @@
-/* ==========================================================================
- * menu_admin.c —— 管理员主菜单 实现
- * --------------------------------------------------------------------------
- * 负责组：管理员组
- * 对应头文件：inc/menu.h
- * 对应界面原型：教程 1.7 "管理员主菜单"
- *
- * 菜单项和各自调用的函数（与 menu.h 里 menu_admin 的注释一致）：
- *   1. 患者档案管理  -> patient_query_all / patient_query_by_id /
- *                       patient_update_self / patient_delete / patient_export
- *   2. 医生管理      -> doctor_query_all / doctor_query_by_id /
- *                       doctor_add / doctor_update / doctor_delete
- *   3. 预约查询      -> appointment_query_all
- *   4. 就诊记录查询  -> visit_query_all
- *   5. 处方查询      -> prescription_query_all
- *   6. 药品管理      -> medicine_query_all / medicine_query_by_id /
- *                       medicine_add / medicine_stock_in / medicine_stock_out /
- *                       medicine_update_price / medicine_delete
- *   7. 病历查询      -> medical_record_query_all
- *   8. 修改密码      -> user_change_password
- *   0. 退出系统
- *
- * 说明：
- *   - 输入一律按 main.c 里 read_line 的写法读整行，不用 scanf("%d")，
- *     避免 scanf 遇到字母卡住、以及残留字符窜到下一次输入里。
- *   - 所有失败分支都按各模块注释里约定的返回码给出中文提示。
- *   - 查询类（3/4/5/7）依赖其它组的模块，那些文件目前还是空壳时，
- *     这里照常调用，返回 0 条就提示"暂无记录"，不影响本菜单编译运行。
- * ========================================================================== */
 
 #include "menu.h"
 #include "patient.h"
@@ -37,6 +8,8 @@
 #include "prescription.h"
 #include "medical_record.h"
 #include "utils.h"
+#include "menu_common.h"
+#include "cli_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,108 +17,26 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-/* ==========================================================================
- * 输入辅助（写法参照 src/main.c 里的 read_line / prompt）
- * ========================================================================== */
 
-/* 读一整行，去掉末尾换行。返回 0 成功，-1 读失败/输入结束
- *
- * 注意 else 分支不能省：fgets 最多只读 size-1 字节，若这一行比缓冲区还长，
- * 它会刚好填满缓冲区、连换行都没读到就返回，剩下的字符会被下一次读取
- * 当成新的一行，把后面每个字段都顶错一位且不报错。 */
-static int read_line(char* buf, int size) {
-    if (!fgets(buf, size, stdin)) return -1;
 
-    size_t len = strlen(buf);
-    if (len > 0 && buf[len - 1] == '\n') {
-        buf[len - 1] = '\0';                /* 正常情况：读到换行，去掉它 */
-    } else {
-        int c;                              /* 缓冲区装满了，丢掉本行剩下的字符 */
-        while ((c = getchar()) != '\n' && c != EOF) { /* 空循环 */ }
-    }
-    return 0;
-}
 
-/* 显示提示语后读一整行字符串。
- * 读到不是合法 UTF-8 的字节就重问：这种输入原样发给 MySQL 会被拒
- * （Incorrect string value），在这里拦下来才能告诉用户真正的原因。 */
-static void prompt(const char* label, char* buf, int size) {
-    for (;;) {
-        printf("%s", label);
-        fflush(stdout);
-        if (read_line(buf, size) != 0) { buf[0] = '\0'; return; }
-        if (utf8_valid(buf)) return;
-        printf("输入里含有非 UTF-8 的字节，MySQL 会拒绝这样的内容。常见原因有两个：\n"
-               "  1) 当前终端/粘贴内容的编码不是 UTF-8 —— 确认 locale 里带 UTF-8；\n"
-               "  2) 这一行太长，被输入缓冲区截断，末尾正好切在汉字中间 —— 请分短一些。\n"
-               "请修改后重新输入：\n");
-    }
-}
 
-/* 显示提示语后读一个整数 */
-static void prompt_int(const char* label, int* out) {
-    char buf[32];
-    prompt(label, buf, sizeof(buf));
-    *out = atoi(buf);
-}
 
-/* 显示提示语后读一个浮点数 */
-static void prompt_double(const char* label, double* out) {
-    char buf[32];
-    prompt(label, buf, sizeof(buf));
-    *out = atof(buf);
-}
 
-/* 读一个菜单选项。返回 0 成功，-1 输入非法，-2 输入结束（Ctrl+D 或管道读完） */
-static int read_choice(int* out) {
-    char buf[32];
-    if (read_line(buf, sizeof(buf)) != 0) return -2;
-    if (sscanf(buf, "%d", out) != 1) return -1;
-    return 0;
-}
 
-/* 输入为空时用旧值兜底（修改信息里"直接回车保留原值"） */
-static void keep_or(const char* defval, char* buf, int size) {
-    if (buf[0] == '\0' && defval && defval[0]) {
-        snprintf(buf, (size_t)size, "%s", defval);
-    }
-}
 
-/* 返回码 -> 中文原因，供各失败分支打印 */
-static const char* err_text(int ret) {
-    switch (ret) {
-        case -1: return "数据库连接失败";
-        case -2: return "SQL 执行失败";
-        case -3: return "唯一字段重复";
-        case -4: return "记录不存在";
-        case -5: return "库存不足";
-        case -6: return "越权操作或状态不允许";
-        case -7: return "账号或病历已锁定";
-        case -8: return "重复挂号";
-        default: return "未知错误";
-    }
-}
 
-/* 预约状态：t_appointment.status 0 待就诊 / 1 已就诊 / 2 已取消 */
-static const char* appt_status_text(int status) {
-    switch (status) {
-        case 0: return "待就诊";
-        case 1: return "已就诊";
-        case 2: return "已取消";
-        default: return "未知";
-    }
-}
 
-/* 处方状态：t_prescription.status 1 有效 / 0 作废 */
-static const char* presc_status_text(int status) {
-    return status == 1 ? "有效" : "已作废";
-}
 
-/* ==========================================================================
- * 1. 患者档案管理（查 / 改 / 注销 / 导出）
- * ========================================================================== */
 
-/* 查询全部患者 */
+
+
+
+
+
+
+
+
 static void patient_list(DB_HANDLE* db) {
     Patient* list = NULL;
     int count = 0;
@@ -166,7 +57,6 @@ static void patient_list(DB_HANDLE* db) {
     }
 
     {
-        /* 列宽按【显示列】算：汉字占 2 列。负数 = 右对齐 */
         const int   w[] = {12, 12, 4, -4, 20, 14, 0};
         const char* cells[7];
         char        age_txt[8];
@@ -192,13 +82,12 @@ static void patient_list(DB_HANDLE* db) {
     patient_list_free(list);
 }
 
-/* 按编号查询单个患者 */
 static void patient_query(DB_HANDLE* db) {
     char patient_id[20];
     Patient p;
     int ret;
 
-    prompt("请输入患者编号（如 P20260001，0 返回）：", patient_id, sizeof(patient_id));
+    cli_prompt("请输入患者编号（如 P20260001，0 返回）：", patient_id, sizeof(patient_id));
     if (patient_id[0] == '\0' || strcmp(patient_id, "0") == 0) return;
 
     memset(&p, 0, sizeof(p));
@@ -223,18 +112,17 @@ static void patient_query(DB_HANDLE* db) {
     printf("  状态：    %s\n", p.status == 1 ? "正常" : "已注销");
 }
 
-/* 修改患者联系方式（电话/住址） */
 static void patient_update(DB_HANDLE* db) {
     char patient_id[20];
     char phone[20];
     char address[200];
     int ret;
 
-    prompt("请输入患者编号（0 返回）：", patient_id, sizeof(patient_id));
+    cli_prompt("请输入患者编号（0 返回）：", patient_id, sizeof(patient_id));
     if (patient_id[0] == '\0' || strcmp(patient_id, "0") == 0) return;
 
-    prompt("新电话：", phone, sizeof(phone));
-    prompt("新住址：", address, sizeof(address));
+    cli_prompt("新电话：", phone, sizeof(phone));
+    cli_prompt("新住址：", address, sizeof(address));
 
     ret = patient_update_self(db, patient_id, phone, address);
     if (ret == 0) {
@@ -246,16 +134,15 @@ static void patient_update(DB_HANDLE* db) {
     }
 }
 
-/* 注销患者（软删除） */
 static void patient_delete_flow(DB_HANDLE* db) {
     char patient_id[20];
     char ans[16];
     int ret;
 
-    prompt("请输入要注销的患者编号（0 返回）：", patient_id, sizeof(patient_id));
+    cli_prompt("请输入要注销的患者编号（0 返回）：", patient_id, sizeof(patient_id));
     if (patient_id[0] == '\0' || strcmp(patient_id, "0") == 0) return;
 
-    prompt("确认注销该患者？注销后不能登录、不能挂号。(y/N)：", ans, sizeof(ans));
+    cli_prompt("确认注销该患者？注销后不能登录、不能挂号。(y/N)：", ans, sizeof(ans));
     if (ans[0] != 'y' && ans[0] != 'Y') {
         printf("已取消。\n");
         return;
@@ -271,12 +158,6 @@ static void patient_delete_flow(DB_HANDLE* db) {
     }
 }
 
-/* 准备导出路径：目录不存在就建出来，建不出来或写不进去就退回当前目录的同名文件。
- * 成功时把最终要用的路径写进 actual 并返回 0；两个方案都不可写返回 -1。
- *
- * 为什么需要这一步：程序通常在 bin/ 目录下运行，那里没有 data/ 子目录，
- * 直接 fopen("data/patients_export.txt") 会失败 —— 而失败原因只有一句
- * "SQL 执行失败"，看不出是目录不存在。 */
 static int prepare_out_path(const char* path, char* actual, size_t actualsz) {
     char        dir[128];
     char        base[64];
@@ -286,24 +167,22 @@ static int prepare_out_path(const char* path, char* actual, size_t actualsz) {
 
     snprintf(actual, actualsz, "%s", path);
 
-    fp = fopen(actual, "a");             /* 原路径能直接写就行（探路用 "a"，别清掉已存在的文件） */
+    fp = fopen(actual, "a");
     if (fp) { fclose(fp); return 0; }
 
     slash = strrchr(path, '/');
-    if (!slash || slash == path) return -1;   /* 没有目录部分（或根目录），没得退回 */
+    if (!slash || slash == path) return -1;
 
     if ((size_t)(slash - path) >= sizeof(dir)) return -1;
     snprintf(dir,  sizeof(dir),  "%.*s", (int)(slash - path), path);
     snprintf(base, sizeof(base), "%s", slash + 1);
     if (base[0] == '\0') return -1;
 
-    /* 目录不存在（stat 失败）就建一层出来，再试一次 */
     if (stat(dir, &st) != 0 && mkdir(dir, 0755) == 0) {
         fp = fopen(actual, "a");
         if (fp) { fclose(fp); return 0; }
     }
 
-    /* 目录建不出来或建了仍然写不进去：退回当前目录的同名文件 */
     snprintf(actual, actualsz, "%s", base);
     fp = fopen(actual, "a");
     if (fp) { fclose(fp); return 0; }
@@ -311,13 +190,12 @@ static int prepare_out_path(const char* path, char* actual, size_t actualsz) {
     return -1;
 }
 
-/* 导出患者列表到文本文件 */
 static void patient_export_flow(DB_HANDLE* db) {
     char filename[128];
     char actual[256];
     int ret;
 
-    prompt("导出文件名（直接回车用默认 data/patients_export.txt）：",
+    cli_prompt("导出文件名（直接回车用默认 data/patients_export.txt）：",
            filename, sizeof(filename));
     if (filename[0] == '\0') {
         snprintf(filename, sizeof(filename), "data/patients_export.txt");
@@ -331,7 +209,6 @@ static void patient_export_flow(DB_HANDLE* db) {
 
     ret = patient_export(db, actual);
     if (ret == 0) {
-        /* 打印绝对路径：程序常在 bin/ 下运行，只说相对路径容易让人找不到文件 */
         char full[512];
         if (strcmp(actual, filename) != 0) {
             printf("%s 写不进去，已改为导出到当前目录的 %s\n", filename, actual);
@@ -344,7 +221,6 @@ static void patient_export_flow(DB_HANDLE* db) {
     }
 }
 
-/* 患者档案管理子菜单 */
 static void do_patient_menu(DB_HANDLE* db) {
     int running = 1;
 
@@ -362,7 +238,7 @@ static void do_patient_menu(DB_HANDLE* db) {
         printf("请输入选项[0-5]：");
         fflush(stdout);
 
-        r = read_choice(&choice);
+        r = cli_read_choice(&choice);
         if (r == -2) return;
         if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
 
@@ -378,11 +254,7 @@ static void do_patient_menu(DB_HANDLE* db) {
     }
 }
 
-/* ==========================================================================
- * 2. 医生管理（增 / 查 / 改 / 离职）
- * ========================================================================== */
 
-/* 查询医生列表 */
 static void doctor_list(DB_HANDLE* db) {
     Doctor* list = NULL;
     int count = 0;
@@ -426,13 +298,12 @@ static void doctor_list(DB_HANDLE* db) {
     doctor_list_free(list);
 }
 
-/* 按编号查询单个医生 */
 static void doctor_query(DB_HANDLE* db) {
     char doctor_id[10];
     Doctor d;
     int ret;
 
-    prompt("请输入医生编号（如 D001，0 返回）：", doctor_id, sizeof(doctor_id));
+    cli_prompt("请输入医生编号（如 D001，0 返回）：", doctor_id, sizeof(doctor_id));
     if (doctor_id[0] == '\0' || strcmp(doctor_id, "0") == 0) return;
 
     memset(&d, 0, sizeof(d));
@@ -456,7 +327,6 @@ static void doctor_query(DB_HANDLE* db) {
     printf("  状态：    %s\n", d.status == 1 ? "在职" : "离职");
 }
 
-/* 新增医生 */
 static void doctor_add_flow(DB_HANDLE* db) {
     Doctor d;
     int ret;
@@ -465,12 +335,12 @@ static void doctor_add_flow(DB_HANDLE* db) {
     d.status = 1;
 
     printf("\n=== 新增医生 ===\n");
-    prompt("姓名：",           d.name,     sizeof(d.name));
-    prompt("性别(男/女)：",    d.gender,   sizeof(d.gender));
-    prompt("职称(如 主治医师)：", d.title, sizeof(d.title));
-    prompt("科室(如 内科)：",  d.dept,     sizeof(d.dept));
-    prompt("联系电话：",       d.phone,    sizeof(d.phone));
-    prompt("登录密码：",       d.password, sizeof(d.password));
+    cli_prompt("姓名：",           d.name,     sizeof(d.name));
+    cli_prompt("性别(男/女)：",    d.gender,   sizeof(d.gender));
+    cli_prompt("职称(如 主治医师)：", d.title, sizeof(d.title));
+    cli_prompt("科室(如 内科)：",  d.dept,     sizeof(d.dept));
+    cli_prompt("联系电话：",       d.phone,    sizeof(d.phone));
+    cli_prompt("登录密码：",       d.password, sizeof(d.password));
 
     ret = doctor_add(db, &d);
     if (ret == 0) {
@@ -482,7 +352,6 @@ static void doctor_add_flow(DB_HANDLE* db) {
     }
 }
 
-/* 修改医生信息（职称/科室/电话，其余保留原值） */
 static void doctor_update_flow(DB_HANDLE* db) {
     char doctor_id[10];
     char title[20];
@@ -491,7 +360,7 @@ static void doctor_update_flow(DB_HANDLE* db) {
     Doctor d;
     int ret;
 
-    prompt("请输入医生编号（0 返回）：", doctor_id, sizeof(doctor_id));
+    cli_prompt("请输入医生编号（0 返回）：", doctor_id, sizeof(doctor_id));
     if (doctor_id[0] == '\0' || strcmp(doctor_id, "0") == 0) return;
 
     memset(&d, 0, sizeof(d));
@@ -514,13 +383,13 @@ static void doctor_update_flow(DB_HANDLE* db) {
     snprintf(dept,  sizeof(dept),  "%s", d.dept);
     snprintf(phone, sizeof(phone), "%s", d.phone);
 
-    prompt("职称(如 主治医师)：", title, sizeof(title));
-    prompt("科室(如 内科)：",     dept,  sizeof(dept));
-    prompt("联系电话：",          phone, sizeof(phone));
+    cli_prompt("职称(如 主治医师)：", title, sizeof(title));
+    cli_prompt("科室(如 内科)：",     dept,  sizeof(dept));
+    cli_prompt("联系电话：",          phone, sizeof(phone));
 
-    keep_or(d.title, title, sizeof(title));
-    keep_or(d.dept,  dept,  sizeof(dept));
-    keep_or(d.phone, phone, sizeof(phone));
+    cli_keep_or(d.title, title, sizeof(title));
+    cli_keep_or(d.dept,  dept,  sizeof(dept));
+    cli_keep_or(d.phone, phone, sizeof(phone));
 
     snprintf(d.title, sizeof(d.title), "%s", title);
     snprintf(d.dept,  sizeof(d.dept),  "%s", dept);
@@ -536,16 +405,15 @@ static void doctor_update_flow(DB_HANDLE* db) {
     }
 }
 
-/* 医生离职（软删除） */
 static void doctor_delete_flow(DB_HANDLE* db) {
     char doctor_id[10];
     char ans[16];
     int ret;
 
-    prompt("请输入要办理离职的医生编号（0 返回）：", doctor_id, sizeof(doctor_id));
+    cli_prompt("请输入要办理离职的医生编号（0 返回）：", doctor_id, sizeof(doctor_id));
     if (doctor_id[0] == '\0' || strcmp(doctor_id, "0") == 0) return;
 
-    prompt("确认该医生离职？离职后不能登录。(y/N)：", ans, sizeof(ans));
+    cli_prompt("确认该医生离职？离职后不能登录。(y/N)：", ans, sizeof(ans));
     if (ans[0] != 'y' && ans[0] != 'Y') {
         printf("已取消。\n");
         return;
@@ -561,7 +429,6 @@ static void doctor_delete_flow(DB_HANDLE* db) {
     }
 }
 
-/* 医生管理子菜单 */
 static void do_doctor_menu(DB_HANDLE* db) {
     int running = 1;
 
@@ -579,7 +446,7 @@ static void do_doctor_menu(DB_HANDLE* db) {
         printf("请输入选项[0-5]：");
         fflush(stdout);
 
-        r = read_choice(&choice);
+        r = cli_read_choice(&choice);
         if (r == -2) return;
         if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
 
@@ -595,11 +462,7 @@ static void do_doctor_menu(DB_HANDLE* db) {
     }
 }
 
-/* ==========================================================================
- * 6. 药品管理（盘点 / 查 / 增 / 入库 / 出库 / 调价）
- * ========================================================================== */
 
-/* 药品盘点：列出全部药品，库存低于 50 的标注"库存不足" */
 static void medicine_list(DB_HANDLE* db) {
     Medicine* list = NULL;
     int count = 0;
@@ -634,7 +497,6 @@ static void medicine_list(DB_HANDLE* db) {
         for (i = 0; i < count; i++) {
             snprintf(price_txt, sizeof(price_txt), "%.2f", list[i].price);
             snprintf(stock_txt, sizeof(stock_txt), "%d", list[i].stock);
-            /* 库存预警标注跟在最后一列厂家后面，拼成一个字符串一起打印 */
             snprintf(man_txt, sizeof(man_txt), "%s%s", list[i].manufacturer,
                      list[i].stock < 50 ? "  [库存不足]" : "");
             cells[0] = list[i].med_id;
@@ -651,13 +513,12 @@ static void medicine_list(DB_HANDLE* db) {
     medicine_list_free(list);
 }
 
-/* 按编号查询单个药品 */
 static void medicine_query(DB_HANDLE* db) {
     char med_id[20];
     Medicine m;
     int ret;
 
-    prompt("请输入药品编号（如 M001，0 返回）：", med_id, sizeof(med_id));
+    cli_prompt("请输入药品编号（如 M001，0 返回）：", med_id, sizeof(med_id));
     if (med_id[0] == '\0' || strcmp(med_id, "0") == 0) return;
 
     memset(&m, 0, sizeof(m));
@@ -680,7 +541,6 @@ static void medicine_query(DB_HANDLE* db) {
     printf("  厂家：    %s\n", m.manufacturer);
 }
 
-/* 新增药品 */
 static void medicine_add_flow(DB_HANDLE* db) {
     Medicine m;
     int ret;
@@ -688,13 +548,13 @@ static void medicine_add_flow(DB_HANDLE* db) {
     memset(&m, 0, sizeof(m));
 
     printf("\n=== 新增药品 ===\n");
-    prompt("药品编号(如 M002)：",  m.med_id,       sizeof(m.med_id));
-    prompt("药品名称：",            m.med_name,     sizeof(m.med_name));
-    prompt("规格(如 0.25g*24粒)：", m.spec,         sizeof(m.spec));
-    prompt("单位(如 盒)：",         m.unit,         sizeof(m.unit));
-    prompt_double("单价：",         &m.price);
-    prompt_int("初始库存：",        &m.stock);
-    prompt("生产厂家：",            m.manufacturer, sizeof(m.manufacturer));
+    cli_prompt("药品编号(如 M002)：",  m.med_id,       sizeof(m.med_id));
+    cli_prompt("药品名称：",            m.med_name,     sizeof(m.med_name));
+    cli_prompt("规格(如 0.25g*24粒)：", m.spec,         sizeof(m.spec));
+    cli_prompt("单位(如 盒)：",         m.unit,         sizeof(m.unit));
+    cli_prompt_double("单价：",         &m.price);
+    cli_prompt_int("初始库存：",        &m.stock);
+    cli_prompt("生产厂家：",            m.manufacturer, sizeof(m.manufacturer));
 
     if (m.med_id[0] == '\0') {
         printf("药品编号不能为空，已取消。\n");
@@ -719,16 +579,15 @@ static void medicine_add_flow(DB_HANDLE* db) {
     }
 }
 
-/* 入库 */
 static void medicine_stock_in_flow(DB_HANDLE* db) {
     char med_id[20];
     int quantity;
     int ret;
 
-    prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
+    cli_prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
     if (med_id[0] == '\0' || strcmp(med_id, "0") == 0) return;
 
-    prompt_int("入库数量：", &quantity);
+    cli_prompt_int("入库数量：", &quantity);
     if (quantity <= 0) {
         printf("入库数量必须大于 0，已取消。\n");
         return;
@@ -744,16 +603,15 @@ static void medicine_stock_in_flow(DB_HANDLE* db) {
     }
 }
 
-/* 出库 */
 static void medicine_stock_out_flow(DB_HANDLE* db) {
     char med_id[20];
     int quantity;
     int ret;
 
-    prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
+    cli_prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
     if (med_id[0] == '\0' || strcmp(med_id, "0") == 0) return;
 
-    prompt_int("出库数量：", &quantity);
+    cli_prompt_int("出库数量：", &quantity);
     if (quantity <= 0) {
         printf("出库数量必须大于 0，已取消。\n");
         return;
@@ -771,16 +629,15 @@ static void medicine_stock_out_flow(DB_HANDLE* db) {
     }
 }
 
-/* 删除药品（被历史处方引用过的不让删，保住处方明细） */
 static void medicine_delete_flow(DB_HANDLE* db) {
     char med_id[20];
     char ans[16];
     int ret;
 
-    prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
+    cli_prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
     if (med_id[0] == '\0' || strcmp(med_id, "0") == 0) return;
 
-    prompt("确认删除该药品？删除后不可恢复。(y/N)：", ans, sizeof(ans));
+    cli_prompt("确认删除该药品？删除后不可恢复。(y/N)：", ans, sizeof(ans));
     if (ans[0] != 'y' && ans[0] != 'Y') {
         printf("已取消。\n");
         return;
@@ -798,16 +655,15 @@ static void medicine_delete_flow(DB_HANDLE* db) {
     }
 }
 
-/* 调价 */
 static void medicine_price_flow(DB_HANDLE* db) {
     char med_id[20];
     double new_price;
     int ret;
 
-    prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
+    cli_prompt("药品编号（0 返回）：", med_id, sizeof(med_id));
     if (med_id[0] == '\0' || strcmp(med_id, "0") == 0) return;
 
-    prompt_double("新单价：", &new_price);
+    cli_prompt_double("新单价：", &new_price);
     if (new_price < 0) {
         printf("单价不能为负，已取消。\n");
         return;
@@ -823,7 +679,6 @@ static void medicine_price_flow(DB_HANDLE* db) {
     }
 }
 
-/* 药品管理子菜单 */
 static void do_medicine_menu(DB_HANDLE* db) {
     int running = 1;
 
@@ -843,7 +698,7 @@ static void do_medicine_menu(DB_HANDLE* db) {
         printf("请输入选项[0-7]：");
         fflush(stdout);
 
-        r = read_choice(&choice);
+        r = cli_read_choice(&choice);
         if (r == -2) return;
         if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
 
@@ -861,11 +716,7 @@ static void do_medicine_menu(DB_HANDLE* db) {
     }
 }
 
-/* ==========================================================================
- * 3/4/5/7 查询类：预约 / 就诊记录 / 处方 / 病历
- * ========================================================================== */
 
-/* 3. 预约查询 */
 static void do_appointment_query(DB_HANDLE* db) {
     Appointment* list = NULL;
     int count = 0;
@@ -911,7 +762,6 @@ static void do_appointment_query(DB_HANDLE* db) {
     appointment_list_free(list);
 }
 
-/* 4. 就诊记录查询 */
 static void do_visit_query(DB_HANDLE* db) {
     VisitRecord* list = NULL;
     int count = 0;
@@ -949,7 +799,6 @@ static void do_visit_query(DB_HANDLE* db) {
     visit_list_free(list);
 }
 
-/* 5. 处方查询 */
 static void do_prescription_query(DB_HANDLE* db) {
     Prescription* list = NULL;
     int count = 0;
@@ -995,7 +844,6 @@ static void do_prescription_query(DB_HANDLE* db) {
     prescription_list_free(list);
 }
 
-/* 7. 病历查询 */
 static void do_medical_record_query(DB_HANDLE* db) {
     MedicalRecord* list = NULL;
     int count = 0;
@@ -1029,49 +877,11 @@ static void do_medical_record_query(DB_HANDLE* db) {
     medical_record_list_free(list);
 }
 
-/* ==========================================================================
- * 8. 修改密码
- * ========================================================================== */
-static void do_change_password(DB_HANDLE* db, const LoginUser* user) {
-    char old_pwd[64];
-    char new_pwd[64];
-    char confirm[64];
-    int ret;
 
-    prompt("原密码：",     old_pwd, sizeof(old_pwd));
-    prompt("新密码：",     new_pwd, sizeof(new_pwd));
-    prompt("确认新密码：", confirm, sizeof(confirm));
 
-    if (new_pwd[0] == '\0') {
-        printf("新密码不能为空，已取消。\n");
-        return;
-    }
-    if (strcmp(new_pwd, confirm) != 0) {
-        printf("两次输入的新密码不一致，已取消。\n");
-        return;
-    }
-    if (strcmp(old_pwd, new_pwd) == 0) {
-        printf("新密码和原密码相同，已取消。\n");
-        return;
-    }
-
-    ret = user_change_password(db, user->role, user->id, old_pwd, new_pwd);
-    if (ret == 0) {
-        printf("密码修改成功，下次登录请用新密码。\n");
-    } else if (ret == -4) {
-        printf("修改失败：原密码错误\n");
-    } else {
-        printf("修改失败：%s\n", err_text(ret));
-    }
-}
-
-/* ==========================================================================
- * 管理员主循环
- * ========================================================================== */
 void menu_admin(DB_HANDLE* db, const LoginUser* user) {
     int running = 1;
 
-    /* 角色 1 = 管理员，越权直接拒绝（教程 1.6 安全需求：越权操作直接拒绝） */
     if (!db || !user || user->role != 1) return;
 
     printf("\n========================================\n");
@@ -1096,8 +906,8 @@ void menu_admin(DB_HANDLE* db, const LoginUser* user) {
         printf("请输入选项[0-8]：");
         fflush(stdout);
 
-        r = read_choice(&choice);
-        if (r == -2) return;                     /* 输入结束，直接返回，避免空转 */
+        r = cli_read_choice(&choice);
+        if (r == -2) return;
         if (r != 0) { printf("输入无效，请重新输入\n"); continue; }
 
         switch (choice) {
@@ -1108,7 +918,7 @@ void menu_admin(DB_HANDLE* db, const LoginUser* user) {
             case 5: do_prescription_query(db);      break;
             case 6: do_medicine_menu(db);           break;
             case 7: do_medical_record_query(db);    break;
-            case 8: do_change_password(db, user);   break;
+            case 8: menu_change_password(db, user);   break;
             case 0: running = 0;                    break;
             default: printf("无效选项\n");          break;
         }

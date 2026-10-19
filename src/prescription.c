@@ -1,23 +1,3 @@
-/* ==========================================================================
- * prescription.c —— M05 处方管理 实现
- * --------------------------------------------------------------------------
- * 负责组：医生组
- * 作者：陈翔宇
- * 创建日期：2026-10-13
- * 对应头文件：inc/prescription.h
- * 对应表：t_prescription（主表）、t_presc_detail（明细）、t_medicine（扣库存）
- *
- * 实现说明：
- *   1) prescription_add 按 prescription.h 的事务要求，把"写主表""写明细"
- *      "扣库存"三步放在同一个事务里。任一味药库存不足或药品不存在，
- *      整张处方都不生效，统一 ROLLBACK。
- *   2) unit_price 取开方当刻 t_medicine.price 的快照，之后药品调价不影响
- *      已有处方；subtotal = quantity × unit_price 由本函数算好入库。
- *   3) 库存校验按"逐行比较当前库存"做：本事务前面几行已经扣过库存，
- *      每一行读到的都是扣完之后的值，所以直接比本行数量即可，
- *      同一药品分多行录入也自然叠加，不会误报。
- *   4) prescription_void 只把 status 置 0，不回滚库存——药已经发给患者了。
- * ========================================================================== */
 
 #include "prescription.h"
 
@@ -26,61 +6,10 @@
 #include <string.h>
 
 #define PRESC_SQL_BUF 4096
-/* 诊断结果在结构体里 200 字节，转义后最多 400，取 512 足够 */
 #define PRESC_ESC_BUF 512
-/* 一次处方最多允许的明细条数（明细数组由调用方提供，这里限个上限） */
 #define PRESC_MAX_ITEMS 64
 
-/* --------------------------------------------------------------------------
- * 本文件用到的小工具
- * -------------------------------------------------------------------------- */
 
-/* 把字符串转义后拼成 SQL 字面量（带两边的单引号），写进 dst。
- * 直接拼字符串的话，用户输入里带个单引号就会把 SQL 拼坏，所以统一走一遍
- * mysql_real_escape_string。src 传 NULL 时按空字符串处理。
- * dst 装不下时返回 NULL，调用方跳过即可。 */
-static char* escape_str(DB_HANDLE* db, const char* src, char* dst, size_t dstsz) {
-    size_t n;
-    if (!dst || dstsz < 3) return NULL;
-    if (!src) src = "";
-    n = mysql_real_escape_string(db->mysql, dst + 1, src, (unsigned long)strlen(src));
-    if (n + 3 > dstsz) return NULL;
-    dst[0] = '\'';
-    dst[n + 1] = '\'';
-    dst[n + 2] = '\0';
-    return dst;
-}
-
-/* 取一行里第 idx 列，NULL 列或越界都返回空字符串 */
-static const char* col_str(DB_RES* res, DB_ROW* row, int idx) {
-    if (!row || !row->fields) return "";
-    if (idx < 0 || idx >= row->col_cnt || idx >= res->col_cnt) return "";
-    if (!row->fields[idx]) return "";
-    return row->fields[idx];
-}
-
-/* 取一行里第 idx 列当整数用 */
-static int col_int(DB_RES* res, DB_ROW* row, int idx) {
-    const char* s = col_str(res, row, idx);
-    return s[0] ? atoi(s) : 0;
-}
-
-/* 取一行里第 idx 列当小数用 */
-static double col_double(DB_RES* res, DB_ROW* row, int idx) {
-    const char* s = col_str(res, row, idx);
-    return s[0] ? atof(s) : 0.0;
-}
-
-/* 开事务。0 成功，非 0 是给调用方直接返回的错误码 */
-static int begin_tx(DB_HANDLE* db) {
-    if (!db || !db->is_connected) return -1;
-    if (db_execute(db, "BEGIN") < 0) return -2;
-    return 0;
-}
-
-/* --------------------------------------------------------------------------
- * 内部函数声明
- * -------------------------------------------------------------------------- */
 static int presc_fetch_visit(DB_HANDLE* db, int visit_id,
                              char* out_patient, size_t patient_size,
                              char* out_doctor, size_t doctor_size);
@@ -89,11 +18,6 @@ static int presc_fetch_medicine(DB_HANDLE* db, const char* med_id,
 static int presc_load(DB_HANDLE* db, const char* where,
                       Prescription** out_list, int* out_count);
 
-/* ==========================================================================
- * 开处方
- * 返回：0 成功；-1 未连接；-2 SQL 失败（已回滚）；-4 就诊记录不存在；
- *       -5 库存不足（已回滚）；-6 该就诊不是本人接诊的
- * ========================================================================== */
 int prescription_add(DB_HANDLE* db, Prescription* p,
                      PrescDetail* items, int item_count) {
     char   buf[PRESC_SQL_BUF];
@@ -107,44 +31,35 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
     char*  lit_did;
     char*  lit_med;
     char*  lit_dos;
-    char   visit_patient[20];       /* 就诊记录里的患者编号（以此为准） */
-    char   visit_doctor[10];        /* 就诊记录里的接诊医生编号 */
+    char   visit_patient[20];
+    char   visit_doctor[10];
     double price;
     int    stock;
     int    i;
     int    visit_ok;
     int    med_ok;
-    int    ret = -2;                /* 默认按 SQL 失败处理，出错分支里再改具体码 */
+    int    ret = -2;
 
-    /* ---------- 入参校验 ---------- */
-    if (!db || !db->is_connected) return -1;          /* -1 数据库连接失败 */
+    if (!db || !db->is_connected) return -1;
     if (!p || !items || item_count <= 0) return -2;
-    if (p->visit_id <= 0) return -4;                  /* 没挂就诊记录，按不存在处理 */
-    if (item_count > PRESC_MAX_ITEMS) return -2;      /* 超出 used[] 容量，拒绝 */
+    if (p->visit_id <= 0) return -4;
+    if (item_count > PRESC_MAX_ITEMS) return -2;
 
-    /* ---------- 事务开始 ---------- */
-    int t = begin_tx(db);
-    if (t != 0) return t;                             /* -1 未连接 / -2 BEGIN 失败 */
+    int t = db_begin_tx(db);
+    if (t != 0) return t;
 
-    /* ---------- 校验就诊记录 ----------
-     * 1) 记录必须存在
-     * 2) 必须是本人接诊的：不查这条的话，医生输入别人的就诊ID就能开方，
-     *    处方会挂到别人经手的就诊上，属于静默的越权写库
-     * 3) 患者编号以就诊记录里的为准，调用方填什么都不作数——菜单允许手输
-     *    患者编号，填错一位就会把处方记到别的患者名下 */
     visit_ok = presc_fetch_visit(db, p->visit_id,
                                  visit_patient, sizeof(visit_patient),
                                  visit_doctor,  sizeof(visit_doctor));
-    if (visit_ok < 0) goto fail;                      /* SQL 失败 */
-    if (visit_ok == 0) { ret = -4; goto fail; }       /* 就诊记录不存在 */
+    if (visit_ok < 0) goto fail;
+    if (visit_ok == 0) { ret = -4; goto fail; }
     if (strcmp(visit_doctor, p->doctor_id) != 0) { ret = -6; goto fail; }
 
     snprintf(p->patient_id, sizeof(p->patient_id), "%s", visit_patient);
 
-    /* ---------- 写处方主表 ---------- */
-    lit_diag = escape_str(db, p->diagnosis,  esc_diag, sizeof(esc_diag));
-    lit_pid  = escape_str(db, p->patient_id, esc_pid,  sizeof(esc_pid));
-    lit_did  = escape_str(db, p->doctor_id,  esc_did,  sizeof(esc_did));
+    lit_diag = db_escape_literal(db, p->diagnosis,  esc_diag, sizeof(esc_diag));
+    lit_pid  = db_escape_literal(db, p->patient_id, esc_pid,  sizeof(esc_pid));
+    lit_did  = db_escape_literal(db, p->doctor_id,  esc_did,  sizeof(esc_did));
     if (!lit_diag || !lit_pid || !lit_did) { ret = -2; goto fail; }
 
     snprintf(buf, sizeof(buf),
@@ -155,30 +70,23 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
     if (db_execute(db, buf) < 0) goto fail;
 
     p->presc_id = (int)mysql_insert_id(db->mysql);
-    if (p->presc_id <= 0) goto fail;                  /* 拿不到自增主键，说明没插进去 */
+    if (p->presc_id <= 0) goto fail;
     p->status = 1;
 
-    /* ---------- 逐条明细：查单价、校验库存、写明细、扣库存 ---------- */
     for (i = 0; i < item_count; i++) {
         if (items[i].quantity <= 0) { ret = -5; goto fail; }
 
-        /* 查药品当前单价和库存，FOR UPDATE 锁住这一行，防止并发开方超卖。
-         * 同一药品分多行录入时不需要额外累加：本事务前面几行已经扣过库存，
-         * 这里读到的就是扣完之后的当前值，直接比本行数量即可 */
         med_ok = presc_fetch_medicine(db, items[i].med_id, &price, &stock);
-        if (med_ok < 0) goto fail;                    /* SQL 失败 */
-        if (med_ok == 0) { ret = -5; goto fail; }     /* 药品不存在，开不出来 */
+        if (med_ok < 0) goto fail;
+        if (med_ok == 0) { ret = -5; goto fail; }
 
-        if (stock < items[i].quantity) { ret = -5; goto fail; } /* 库存不足，整张处方回滚 */
+        if (stock < items[i].quantity) { ret = -5; goto fail; }
 
-        /* 单价快照 + 小计，算好填回结构体，调用方可以直接展示金额 */
         items[i].unit_price = price;
         items[i].subtotal   = (double)items[i].quantity * price;
 
-        /* med_id 和 dosage 各用一个转义缓冲区：
-         * 两次转义如果共用同一块内存，后一次的结果会把前一次覆盖掉 */
-        lit_med = escape_str(db, items[i].med_id, esc_med, sizeof(esc_med));
-        lit_dos = escape_str(db, items[i].dosage, esc_dos, sizeof(esc_dos));
+        lit_med = db_escape_literal(db, items[i].med_id, esc_med, sizeof(esc_med));
+        lit_dos = db_escape_literal(db, items[i].dosage, esc_dos, sizeof(esc_dos));
         if (!lit_med || !lit_dos) { ret = -2; goto fail; }
 
         snprintf(buf, sizeof(buf),
@@ -192,7 +100,6 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
         items[i].detail_id = (int)mysql_insert_id(db->mysql);
         items[i].presc_id  = p->presc_id;
 
-        /* 扣减库存。条件里带上 stock >= 本行数量，真正超卖时这里影响 0 行 */
         snprintf(buf, sizeof(buf),
                  "UPDATE t_medicine SET stock = stock - %d "
                  "WHERE med_id = %s AND stock >= %d",
@@ -200,11 +107,9 @@ int prescription_add(DB_HANDLE* db, Prescription* p,
 
         if (db_execute(db, buf) < 0) goto fail;
 
-        /* 库存扣减后肯定和原值不同，所以影响行数为 0 只可能是"没有这个药品" */
         if (mysql_affected_rows(db->mysql) == 0) { ret = -5; goto fail; }
     }
 
-    /* ---------- 提交 ---------- */
     db_execute(db, "COMMIT");
     return 0;
 
@@ -213,11 +118,6 @@ fail:
     return ret;
 }
 
-/* ==========================================================================
- * 作废处方：把 status 置 0，不回滚库存
- * 返回：0 成功；-1 未连接；-2 SQL 失败；-4 处方不存在；
- *       -6 不是本人开的，或已是作废状态
- * ========================================================================== */
 int prescription_void(DB_HANDLE* db, int presc_id, const char* doctor_id) {
     char   buf[512];
     char   esc[128];
@@ -229,43 +129,38 @@ int prescription_void(DB_HANDLE* db, int presc_id, const char* doctor_id) {
     if (presc_id <= 0) return -4;
     if (!doctor_id || !doctor_id[0]) return -6;
 
-    /* 先看这张处方在不在、是谁开的、什么状态，才能把 -4 和 -6 区分开 */
     snprintf(buf, sizeof(buf),
              "SELECT doctor_id, status FROM t_prescription WHERE presc_id = %d", presc_id);
     res = db_query(db, buf);
     if (!res) return -2;
 
     row = db_fetch_row(res);
-    if (!row) {                                              /* 处方不存在 */
+    if (!row) {
         db_res_free(res);
         return -4;
     }
-    if (strcmp(col_str(res, row, 0), doctor_id) != 0) {    /* 列 0 = doctor_id */
+    if (strcmp(db_row_str(res, row, 0), doctor_id) != 0) {
         db_res_free(res);
-        return -6;                                           /* 不是本人开的 */
+        return -6;
     }
-    if (col_int(res, row, 1) != 1) {                         /* 列 1 = status */
+    if (db_row_int(res, row, 1) != 1) {
         db_res_free(res);
-        return -6;                                           /* 已经作废了 */
+        return -6;
     }
     db_res_free(res);
 
-    /* 条件里带上原状态：并发下被别人先作废时，这里影响 0 行 */
     snprintf(buf, sizeof(buf),
              "UPDATE t_prescription SET status = 0 "
              "WHERE presc_id = %d AND doctor_id = %s AND status = 1",
-             presc_id, escape_str(db, doctor_id, esc, sizeof(esc)));
+             presc_id, db_escape_literal(db, doctor_id, esc, sizeof(esc)));
 
     affected = db_execute(db, buf);
     if (affected < 0) return -2;
-    if (affected == 0) return -6;    /* 状态已被改动，不再是可作废的有效处方 */
+    if (affected == 0) return -6;
 
     return 0;
 }
 
-/* ==========================================================================
- * 查询某患者的全部处方（不含明细，列表展示用）
- * ========================================================================== */
 int prescription_query_by_patient(DB_HANDLE* db, const char* patient_id,
                                   Prescription** out_list, int* out_count) {
     char where[160];
@@ -276,14 +171,11 @@ int prescription_query_by_patient(DB_HANDLE* db, const char* patient_id,
     if (!db || !db->is_connected) return -1;
     if (!patient_id || !patient_id[0]) return -2;
 
-    if (!escape_str(db, patient_id, esc, sizeof(esc))) return -2;
+    if (!db_escape_literal(db, patient_id, esc, sizeof(esc))) return -2;
     snprintf(where, sizeof(where), "WHERE patient_id = %s", esc);
     return presc_load(db, where, out_list, out_count);
 }
 
-/* ==========================================================================
- * 查询全部处方（管理员用）
- * ========================================================================== */
 int prescription_query_all(DB_HANDLE* db, Prescription** out_list, int* out_count) {
     if (out_list)  *out_list  = NULL;
     if (out_count) *out_count = 0;
@@ -291,10 +183,6 @@ int prescription_query_all(DB_HANDLE* db, Prescription** out_list, int* out_coun
     return presc_load(db, "", out_list, out_count);
 }
 
-/* ==========================================================================
- * 按 ID 查询一张处方及其全部明细
- * 返回：0 成功；-1 未连接；-2 SQL 失败；-4 处方不存在
- * ========================================================================== */
 int prescription_query_by_id(DB_HANDLE* db, int presc_id,
                              Prescription* out,
                              PrescDetail** out_items, int* out_item_count) {
@@ -311,7 +199,6 @@ int prescription_query_by_id(DB_HANDLE* db, int presc_id,
 
     memset(out, 0, sizeof(*out));
 
-    /* ---------- 主表 ---------- */
     snprintf(buf, sizeof(buf),
              "SELECT presc_id, visit_id, patient_id, doctor_id, diagnosis, status, "
              "DATE_FORMAT(create_time, '%%Y-%%m-%%d %%H:%%i:%%s') "
@@ -321,21 +208,20 @@ int prescription_query_by_id(DB_HANDLE* db, int presc_id,
     if (!res) return -2;
 
     row = db_fetch_row(res);
-    if (!row) {                                  /* 处方不存在 */
+    if (!row) {
         db_res_free(res);
         return -4;
     }
 
-    out->presc_id = col_int(res, row, 0);
-    out->visit_id = col_int(res, row, 1);
-    snprintf(out->patient_id,  sizeof(out->patient_id),  "%s", col_str(res, row, 2));
-    snprintf(out->doctor_id,   sizeof(out->doctor_id),   "%s", col_str(res, row, 3));
-    snprintf(out->diagnosis,   sizeof(out->diagnosis),   "%s", col_str(res, row, 4));
-    out->status = col_int(res, row, 5);
-    snprintf(out->create_time, sizeof(out->create_time), "%s", col_str(res, row, 6));
+    out->presc_id = db_row_int(res, row, 0);
+    out->visit_id = db_row_int(res, row, 1);
+    snprintf(out->patient_id,  sizeof(out->patient_id),  "%s", db_row_str(res, row, 2));
+    snprintf(out->doctor_id,   sizeof(out->doctor_id),   "%s", db_row_str(res, row, 3));
+    snprintf(out->diagnosis,   sizeof(out->diagnosis),   "%s", db_row_str(res, row, 4));
+    out->status = db_row_int(res, row, 5);
+    snprintf(out->create_time, sizeof(out->create_time), "%s", db_row_str(res, row, 6));
     db_res_free(res);
 
-    /* ---------- 明细 ---------- */
     snprintf(buf, sizeof(buf),
              "SELECT detail_id, presc_id, med_id, quantity, dosage, unit_price, subtotal "
              "FROM t_presc_detail WHERE presc_id = %d ORDER BY detail_id", presc_id);
@@ -350,19 +236,17 @@ int prescription_query_by_id(DB_HANDLE* db, int presc_id,
         while ((row = db_fetch_row(res)) != NULL) {
             PrescDetail* d;
 
-            /* 双保险：数组按 res->row_cnt 分配，理论上取不到这么多行；
-             * 万一结果集比报出来的行数还多，宁可少读也不能写越界 */
             if (n >= res->row_cnt) break;
 
             d = &arr[n];
             memset(d, 0, sizeof(*d));
-            d->detail_id  = col_int(res, row, 0);
-            d->presc_id   = col_int(res, row, 1);
-            snprintf(d->med_id, sizeof(d->med_id), "%s", col_str(res, row, 2));
-            d->quantity   = col_int(res, row, 3);
-            snprintf(d->dosage, sizeof(d->dosage), "%s", col_str(res, row, 4));
-            d->unit_price = col_double(res, row, 5);
-            d->subtotal   = col_double(res, row, 6);
+            d->detail_id  = db_row_int(res, row, 0);
+            d->presc_id   = db_row_int(res, row, 1);
+            snprintf(d->med_id, sizeof(d->med_id), "%s", db_row_str(res, row, 2));
+            d->quantity   = db_row_int(res, row, 3);
+            snprintf(d->dosage, sizeof(d->dosage), "%s", db_row_str(res, row, 4));
+            d->unit_price = db_row_double(res, row, 5);
+            d->subtotal   = db_row_double(res, row, 6);
             n++;
         }
     }
@@ -375,9 +259,6 @@ int prescription_query_by_id(DB_HANDLE* db, int presc_id,
     return 0;
 }
 
-/* ==========================================================================
- * 释放
- * ========================================================================== */
 void prescription_list_free(Prescription* list) {
     free(list);
 }
@@ -386,11 +267,7 @@ void prescription_detail_free(PrescDetail* items) {
     free(items);
 }
 
-/* ==========================================================================
- * 内部函数
- * ========================================================================== */
 
-/* 查就诊记录：1 存在（回填患者编号和接诊医生编号），0 不存在，-1 SQL 失败 */
 static int presc_fetch_visit(DB_HANDLE* db, int visit_id,
                              char* out_patient, size_t patient_size,
                              char* out_doctor, size_t doctor_size) {
@@ -408,13 +285,12 @@ static int presc_fetch_visit(DB_HANDLE* db, int visit_id,
     row = db_fetch_row(res);
     if (!row) { db_res_free(res); return 0; }
 
-    snprintf(out_patient, patient_size, "%s", col_str(res, row, 0));
-    snprintf(out_doctor,  doctor_size,  "%s", col_str(res, row, 1));
+    snprintf(out_patient, patient_size, "%s", db_row_str(res, row, 0));
+    snprintf(out_doctor,  doctor_size,  "%s", db_row_str(res, row, 1));
     db_res_free(res);
     return 1;
 }
 
-/* 查药品当前单价和库存（加行锁）：1 找到，0 没这个药品，-1 SQL 失败 */
 static int presc_fetch_medicine(DB_HANDLE* db, const char* med_id,
                                 double* out_price, int* out_stock) {
     char   buf[512];
@@ -423,7 +299,7 @@ static int presc_fetch_medicine(DB_HANDLE* db, const char* med_id,
     DB_ROW* row;
 
     if (!med_id || !med_id[0]) return 0;
-    if (!escape_str(db, med_id, esc, sizeof(esc))) return 0;
+    if (!db_escape_literal(db, med_id, esc, sizeof(esc))) return 0;
 
     snprintf(buf, sizeof(buf),
              "SELECT price, stock FROM t_medicine WHERE med_id = %s FOR UPDATE", esc);
@@ -434,13 +310,12 @@ static int presc_fetch_medicine(DB_HANDLE* db, const char* med_id,
     row = db_fetch_row(res);
     if (!row) { db_res_free(res); return 0; }
 
-    if (out_price) *out_price = col_double(res, row, 0);
-    if (out_stock) *out_stock = col_int(res, row, 1);
+    if (out_price) *out_price = db_row_double(res, row, 0);
+    if (out_stock) *out_stock = db_row_int(res, row, 1);
     db_res_free(res);
     return 1;
 }
 
-/* 处方主表 -> Prescription 数组（两个查询函数共用） */
 static int presc_load(DB_HANDLE* db, const char* where,
                       Prescription** out_list, int* out_count) {
     char   buf[PRESC_SQL_BUF];
@@ -470,19 +345,17 @@ static int presc_load(DB_HANDLE* db, const char* where,
         while ((row = db_fetch_row(res)) != NULL) {
             Prescription* p;
 
-            /* 双保险：数组按 res->row_cnt 分配，理论上取不到这么多行；
-             * 万一结果集比报出来的行数还多，宁可少读也不能写越界 */
             if (n >= res->row_cnt) break;
 
             p = &arr[n];
             memset(p, 0, sizeof(*p));
-            p->presc_id = col_int(res, row, 0);
-            p->visit_id = col_int(res, row, 1);
-            snprintf(p->patient_id,  sizeof(p->patient_id),  "%s", col_str(res, row, 2));
-            snprintf(p->doctor_id,   sizeof(p->doctor_id),   "%s", col_str(res, row, 3));
-            snprintf(p->diagnosis,   sizeof(p->diagnosis),   "%s", col_str(res, row, 4));
-            p->status = col_int(res, row, 5);
-            snprintf(p->create_time, sizeof(p->create_time), "%s", col_str(res, row, 6));
+            p->presc_id = db_row_int(res, row, 0);
+            p->visit_id = db_row_int(res, row, 1);
+            snprintf(p->patient_id,  sizeof(p->patient_id),  "%s", db_row_str(res, row, 2));
+            snprintf(p->doctor_id,   sizeof(p->doctor_id),   "%s", db_row_str(res, row, 3));
+            snprintf(p->diagnosis,   sizeof(p->diagnosis),   "%s", db_row_str(res, row, 4));
+            p->status = db_row_int(res, row, 5);
+            snprintf(p->create_time, sizeof(p->create_time), "%s", db_row_str(res, row, 6));
             n++;
         }
     }
