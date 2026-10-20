@@ -28,7 +28,7 @@ static int med_exists(DB_HANDLE* db, const char* med_id) {
     return found;
 }
 
-int medicine_add(DB_HANDLE* db, const Medicine* m) {
+int medicine_add(DB_HANDLE* db, Medicine* m) {
     char buf[MED_SQL_BUF];
     char esc_id[MED_ESC_BUF];
     char esc_name[MED_ESC_BUF];
@@ -40,10 +40,26 @@ int medicine_add(DB_HANDLE* db, const Medicine* m) {
     char* lit_spec;
     char* lit_unit;
     char* lit_man;
+    DB_RES* res;
+    DB_ROW* row;
     int exists;
+    int idlen;
+    int seq = 0;
 
     if (!db || !db->is_connected) return -1;
-    if (!m || !m->med_id[0]) return -2;
+    if (!m) return -2;
+
+    res = db_query(db,
+                   "SELECT MAX(CAST(SUBSTRING(med_id, 2) AS UNSIGNED)) "
+                   "FROM t_medicine WHERE med_id REGEXP '^M[0-9]+$'");
+    if (!res) return -2;
+
+    row = db_fetch_row(res);
+    if (row && row->fields[0]) seq = atoi(row->fields[0]);
+    db_res_free(res);
+    seq++;
+    idlen = snprintf(m->med_id, sizeof(m->med_id), "M%03d", seq);
+    if (idlen < 0 || (size_t)idlen >= sizeof(m->med_id)) return -2;
 
     exists = med_exists(db, m->med_id);
     if (exists < 0) return -2;

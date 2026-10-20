@@ -43,8 +43,7 @@ static int date_ok(const char* s) {
         time_t now = time(NULL);
         struct tm* tm_now = localtime(&now);
         if (!tm_now) return 0;
-        snprintf(today, sizeof(today), "%04d-%02d-%02d",
-                 tm_now->tm_year + 1900, tm_now->tm_mon + 1, tm_now->tm_mday);
+        if (strftime(today, sizeof(today), "%Y-%m-%d", tm_now) == 0) return 0;
     }
     return strcmp(s, today) >= 0;
 }

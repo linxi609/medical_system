@@ -14,7 +14,7 @@ typedef struct {
     char   manufacturer[50];
 } Medicine;
 
-int medicine_add(DB_HANDLE* db, const Medicine* m);
+int medicine_add(DB_HANDLE* db, Medicine* m);
 
 int medicine_stock_in(DB_HANDLE* db, const char* med_id, int quantity);
 

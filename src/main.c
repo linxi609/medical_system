@@ -56,7 +56,7 @@ static void do_login(DB_HANDLE* db) {
     char username[50];
     char password[100];
     cli_prompt("请输入账号：", username, sizeof(username));
-    cli_prompt("请输入密  码：", password, sizeof(password));
+    cli_prompt("请输入密码：", password, sizeof(password));
 
     LoginUser user;
     memset(&user, 0, sizeof(user));

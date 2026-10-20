@@ -557,7 +557,6 @@ static void medicine_add_flow(DB_HANDLE* db) {
     memset(&m, 0, sizeof(m));
 
     printf("\n=== 新增药品 ===\n");
-    cli_prompt("药品编号(如 M002)：",  m.med_id,       sizeof(m.med_id));
     cli_prompt("药品名称：",            m.med_name,     sizeof(m.med_name));
     cli_prompt("规格(如 0.25g*24粒)：", m.spec,         sizeof(m.spec));
     cli_prompt("单位(如 盒)：",         m.unit,         sizeof(m.unit));
@@ -565,10 +564,6 @@ static void medicine_add_flow(DB_HANDLE* db) {
     cli_prompt_int("初始库存：",        &m.stock);
     cli_prompt("生产厂家：",            m.manufacturer, sizeof(m.manufacturer));
 
-    if (m.med_id[0] == '\0') {
-        printf("药品编号不能为空，已取消。\n");
-        return;
-    }
     if (m.price < 0) {
         printf("单价不能为负，已取消。\n");
         return;
@@ -580,9 +575,9 @@ static void medicine_add_flow(DB_HANDLE* db) {
 
     ret = medicine_add(db, &m);
     if (ret == 0) {
-        printf("新增成功。\n");
+        printf("新增成功，药品编号 %s（已自动生成）\n", m.med_id);
     } else if (ret == -3) {
-        printf("新增失败：药品编号已存在\n");
+        printf("新增失败：药品编号已存在，请重试\n");
     } else {
         printf("新增失败：%s\n", err_text(ret));
     }
